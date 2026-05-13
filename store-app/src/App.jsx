@@ -1,5 +1,4 @@
 import { useState, useEffect } from 'react';
-import { getServerIP } from './src/api';
 import Scanner from './components/Scanner.jsx';
 import Inventory from './components/Inventory.jsx';
 import Dashboard from './components/Dashboard.jsx';
