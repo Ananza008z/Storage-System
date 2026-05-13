@@ -48,23 +48,20 @@ export async function recordSale(barcode, name, price, qty = 1) {
   return res.json();
 }
 
-export async function getTodaySales() {
-  const res = await fetch(`${BASE}/sales/today`);
+export async function getTodaySales(date) {
+  const res = await fetchLocal(`/sales/today${date ? `?date=${date}` : ''}`);
   return res.json();
 }
-
-export async function getSummary() {
-  const res = await fetch(`${BASE}/sales/summary`);
+export async function getSummary(date) {
+  const res = await fetchLocal(`/sales/summary${date ? `?date=${date}` : ''}`);
   return res.json();
 }
-
-export async function getTopProducts() {
-  const res = await fetch(`${BASE}/sales/top`);
+export async function getTopProducts(date) {
+  const res = await fetchLocal(`/sales/top${date ? `?date=${date}` : ''}`);
   return res.json();
 }
-
-export async function getHourlySales() {
-  const res = await fetch(`${BASE}/sales/hourly`);
+export async function getHourlySales(date) {
+  const res = await fetchLocal(`/sales/hourly${date ? `?date=${date}` : ''}`);
   return res.json();
 }
 
