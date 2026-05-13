@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { getServerIP } from './src/api';
 import Scanner from './components/Scanner.jsx';
 import Inventory from './components/Inventory.jsx';
 import Dashboard from './components/Dashboard.jsx';
@@ -44,8 +45,16 @@ const tabs = [
 ];
 
 export default function App() {
+  const [ready, setReady] = useState(false);
   const [tab, setTab] = useState('scanner');
   const [cart, setCart] = useState([]);
+
+  useEffect(() => {
+    // Load saved IP before rendering anything
+    getServerIP().then(() => setReady(true));
+  }, []);
+
+  if (!ready) return null;
 
   return (
     <div className="min-h-screen flex flex-col">

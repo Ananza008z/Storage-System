@@ -119,22 +119,44 @@ app.post('/api/sales', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-export async function getTodaySales(date) {
-  const res = await fetchLocal(`/sales/today${date ? `?date=${date}` : ''}`);
-  return res.json();
-}
-export async function getSummary(date) {
-  const res = await fetchLocal(`/sales/summary${date ? `?date=${date}` : ''}`);
-  return res.json();
-}
-export async function getTopProducts(date) {
-  const res = await fetchLocal(`/sales/top${date ? `?date=${date}` : ''}`);
-  return res.json();
-}
-export async function getHourlySales(date) {
-  const res = await fetchLocal(`/sales/hourly${date ? `?date=${date}` : ''}`);
-  return res.json();
-}
+app.get('/api/sales/today', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM sales WHERE sold_at >= CURRENT_DATE ORDER BY sold_at DESC`);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/sales/summary', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT COUNT(*) AS total_transactions, COALESCE(SUM(price*qty),0) AS total_revenue,
+             COALESCE(SUM(qty),0) AS total_items, COUNT(DISTINCT barcode) AS unique_products
+      FROM sales WHERE sold_at >= CURRENT_DATE
+    `);
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/sales/top', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT barcode, name, SUM(qty) AS total_qty, SUM(price*qty) AS total_revenue
+      FROM sales WHERE sold_at >= CURRENT_DATE
+      GROUP BY barcode, name ORDER BY total_revenue DESC LIMIT 10
+    `);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/sales/hourly', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT EXTRACT(HOUR FROM sold_at) AS hour, SUM(price*qty) AS revenue
+      FROM sales WHERE sold_at >= CURRENT_DATE GROUP BY hour ORDER BY hour
+    `);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // Categories
 app.get('/api/categories', async (req, res) => {
