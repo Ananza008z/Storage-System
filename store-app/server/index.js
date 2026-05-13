@@ -126,7 +126,7 @@ app.get('/api/sales/today', async (req, res) => {
     const result = await pool.query(`
       SELECT * FROM sales
       WHERE sold_at AT TIME ZONE 'Asia/Bangkok' >= $1::date 
-      AND sold_at AT TIME ZONE 'Asia/Bangkok' < ($1::date + INTERVAL '1 day')
+        AND sold_at AT TIME ZONE 'Asia/Bangkok' < ($1::date + INTERVAL '1 day')
       ORDER BY sold_at DESC
     `, [d]);
     res.json(result.rows);
@@ -134,33 +134,46 @@ app.get('/api/sales/today', async (req, res) => {
 });
 
 app.get('/api/sales/summary', async (req, res) => {
+  const { date } = req.query;
   try {
+    const d = date || new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
     const result = await pool.query(`
       SELECT COUNT(*) AS total_transactions, COALESCE(SUM(price*qty),0) AS total_revenue,
              COALESCE(SUM(qty),0) AS total_items, COUNT(DISTINCT barcode) AS unique_products
-      FROM sales WHERE sold_at AT TIME ZONE 'Asia/Bangkok' >= CURRENT_DATE
-    `);
+      FROM sales
+      WHERE sold_at AT TIME ZONE 'Asia/Bangkok' >= $1::date
+        AND sold_at AT TIME ZONE 'Asia/Bangkok' < ($1::date + INTERVAL '1 day')
+    `, [d]);
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/sales/top', async (req, res) => {
+  const { date } = req.query;
   try {
+    const d = date || new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
     const result = await pool.query(`
       SELECT barcode, name, SUM(qty) AS total_qty, SUM(price*qty) AS total_revenue
-      FROM sales WHERE sold_at AT TIME ZONE 'Asia/Bangkok' >= CURRENT_DATE
+      FROM sales
+      WHERE sold_at AT TIME ZONE 'Asia/Bangkok' >= $1::date
+        AND sold_at AT TIME ZONE 'Asia/Bangkok' < ($1::date + INTERVAL '1 day')
       GROUP BY barcode, name ORDER BY total_revenue DESC LIMIT 10
-    `);
+    `, [d]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/sales/hourly', async (req, res) => {
+  const { date } = req.query;
   try {
+    const d = date || new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
     const result = await pool.query(`
-      SELECT EXTRACT(HOUR FROM sold_at) AS hour, SUM(price*qty) AS revenue
-      FROM sales WHERE sold_at AT TIME ZONE 'Asia/Bangkok' >= CURRENT_DATE GROUP BY hour ORDER BY hour
-    `);
+      SELECT EXTRACT(HOUR FROM sold_at AT TIME ZONE 'Asia/Bangkok') AS hour, SUM(price*qty) AS revenue
+      FROM sales
+      WHERE sold_at AT TIME ZONE 'Asia/Bangkok' >= $1::date
+        AND sold_at AT TIME ZONE 'Asia/Bangkok' < ($1::date + INTERVAL '1 day')
+      GROUP BY hour ORDER BY hour
+    `, [d]);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
