@@ -1,27 +1,62 @@
 -- ============================================================================
--- ระบบร้านค้า POS (Store System v2) — Supabase Schema, RLS & Seed Data
+-- ระบบร้านค้า POS (Store System v3 — Multi-Store & Role Auth)
 -- วิธีใช้: เปิด Supabase Dashboard -> SQL Editor -> วางโค้ดนี้ทั้งหมดแล้วกด Run
 -- ============================================================================
 
 -- 1. Extensions
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- 2. Tables
+-- 2. Reset old tables cleanly so re-running this script upgrades safely
+DROP TABLE IF EXISTS public.order_items CASCADE;
+DROP TABLE IF EXISTS public.orders CASCADE;
+DROP TABLE IF EXISTS public.products CASCADE;
+DROP TABLE IF EXISTS public.categories CASCADE;
+DROP TABLE IF EXISTS public.store_members CASCADE;
+DROP TABLE IF EXISTS public.stores CASCADE;
+
+-- 3. Profiles (linked to auth.users)
 CREATE TABLE IF NOT EXISTS public.profiles (
   id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  email text NOT NULL,
-  display_name text NOT NULL,
-  role text NOT NULL DEFAULT 'staff' CHECK (role IN ('owner', 'staff')),
-  active boolean NOT NULL DEFAULT true,
+  email text NOT NULL DEFAULT '',
+  display_name text NOT NULL DEFAULT '',
   created_at timestamptz DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public.categories (
-  name text PRIMARY KEY
+-- Drop legacy single-store columns on profiles if upgrading from v2
+ALTER TABLE public.profiles DROP COLUMN IF EXISTS role;
+ALTER TABLE public.profiles DROP COLUMN IF EXISTS active;
+
+-- 4. Stores & Store Memberships (Multi-Store)
+CREATE TABLE public.stores (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text UNIQUE NOT NULL,
+  store_password text NOT NULL,
+  owner_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
+  created_at timestamptz DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public.products (
-  barcode text PRIMARY KEY,
+CREATE TABLE public.store_members (
+  id serial PRIMARY KEY,
+  store_id uuid NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  role text NOT NULL DEFAULT 'staff' CHECK (role IN ('owner', 'staff')),
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz DEFAULT now(),
+  UNIQUE (store_id, user_id)
+);
+
+-- 5. Store-Scoped Catalog & Sales Tables
+CREATE TABLE public.categories (
+  id serial PRIMARY KEY,
+  store_id uuid NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  UNIQUE (store_id, name)
+);
+
+CREATE TABLE public.products (
+  id serial PRIMARY KEY,
+  store_id uuid NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+  barcode text NOT NULL,
   name text NOT NULL,
   price numeric(10,2) NOT NULL,
   cost_price numeric(10,2) NOT NULL DEFAULT 0,
@@ -29,11 +64,13 @@ CREATE TABLE IF NOT EXISTS public.products (
   low_stock_threshold integer NOT NULL DEFAULT 5,
   category text DEFAULT '',
   created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now()
+  updated_at timestamptz DEFAULT now(),
+  UNIQUE (store_id, barcode)
 );
 
-CREATE TABLE IF NOT EXISTS public.orders (
+CREATE TABLE public.orders (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  store_id uuid NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
   order_no serial,
   cashier_id uuid REFERENCES public.profiles(id) ON DELETE SET NULL,
   cashier_name text DEFAULT '',
@@ -47,8 +84,9 @@ CREATE TABLE IF NOT EXISTS public.orders (
   sold_at timestamptz DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public.order_items (
+CREATE TABLE public.order_items (
   id serial PRIMARY KEY,
+  store_id uuid NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
   order_id uuid NOT NULL REFERENCES public.orders(id) ON DELETE CASCADE,
   barcode text NOT NULL,
   name text NOT NULL,
@@ -58,43 +96,34 @@ CREATE TABLE IF NOT EXISTS public.order_items (
   sold_at timestamptz DEFAULT now()
 );
 
--- Indexes for dashboard & lookup speed
-CREATE INDEX IF NOT EXISTS idx_orders_sold_at ON public.orders (sold_at DESC);
-CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON public.order_items (order_id);
-CREATE INDEX IF NOT EXISTS idx_products_category ON public.products (category);
+-- Indexes
+CREATE INDEX idx_store_members_user ON public.store_members (user_id);
+CREATE INDEX idx_store_members_store ON public.store_members (store_id);
+CREATE INDEX idx_categories_store ON public.categories (store_id);
+CREATE INDEX idx_products_store_barcode ON public.products (store_id, barcode);
+CREATE INDEX idx_orders_store_sold_at ON public.orders (store_id, sold_at DESC);
+CREATE INDEX idx_order_items_order_id ON public.order_items (order_id);
 
--- 3. Auto-create profile when user signs up (First user automatically becomes 'owner')
+-- 6. Auto-create profile on signup + backfill any existing auth.users
 CREATE OR REPLACE FUNCTION public.handle_new_user()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
 AS $$
-DECLARE
-  user_count integer;
-  assigned_role text;
-  meta_role text;
 BEGIN
-  SELECT COUNT(*) INTO user_count FROM public.profiles;
-  meta_role := new.raw_user_meta_data->>'role';
-
-  IF user_count = 0 THEN
-    assigned_role := 'owner';
-  ELSIF meta_role IN ('owner', 'staff') THEN
-    assigned_role := meta_role;
-  ELSE
-    assigned_role := 'staff';
-  END IF;
-
-  INSERT INTO public.profiles (id, email, display_name, role, active)
+  INSERT INTO public.profiles (id, email, display_name)
   VALUES (
     new.id,
     COALESCE(new.email, ''),
-    COALESCE(NULLIF(trim(new.raw_user_meta_data->>'display_name'), ''), split_part(COALESCE(new.email, 'user'), '@', 1)),
-    assigned_role,
-    true
+    COALESCE(
+      NULLIF(trim(new.raw_user_meta_data->>'display_name'), ''),
+      split_part(COALESCE(new.email, 'user'), '@', 1)
+    )
   )
-  ON CONFLICT (id) DO NOTHING;
+  ON CONFLICT (id) DO UPDATE SET
+    email = EXCLUDED.email,
+    display_name = COALESCE(NULLIF(public.profiles.display_name, ''), EXCLUDED.display_name);
 
   RETURN new;
 END;
@@ -105,8 +134,19 @@ CREATE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users
   FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
--- 4. RLS Helper Functions
-CREATE OR REPLACE FUNCTION public.is_active_user()
+INSERT INTO public.profiles (id, email, display_name)
+SELECT
+  id,
+  COALESCE(email, ''),
+  COALESCE(
+    NULLIF(trim(raw_user_meta_data->>'display_name'), ''),
+    split_part(COALESCE(email, 'user'), '@', 1)
+  )
+FROM auth.users
+ON CONFLICT (id) DO NOTHING;
+
+-- 7. RLS Helper Functions
+CREATE OR REPLACE FUNCTION public.is_store_member(p_store_id uuid)
 RETURNS boolean
 LANGUAGE sql
 STABLE
@@ -114,12 +154,14 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
   SELECT EXISTS (
-    SELECT 1 FROM public.profiles
-    WHERE id = auth.uid() AND active = true
+    SELECT 1 FROM public.store_members
+    WHERE store_id = p_store_id
+      AND user_id = auth.uid()
+      AND active = true
   );
 $$;
 
-CREATE OR REPLACE FUNCTION public.is_owner()
+CREATE OR REPLACE FUNCTION public.is_store_owner(p_store_id uuid)
 RETURNS boolean
 LANGUAGE sql
 STABLE
@@ -127,155 +169,247 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
   SELECT EXISTS (
-    SELECT 1 FROM public.profiles
-    WHERE id = auth.uid() AND active = true AND role = 'owner'
+    SELECT 1 FROM public.store_members
+    WHERE store_id = p_store_id
+      AND user_id = auth.uid()
+      AND active = true
+      AND role = 'owner'
   );
 $$;
 
--- 5. Enable Row Level Security (RLS)
+-- 8. Store Creation & Join RPC Functions (by Store Name & Store Password)
+CREATE OR REPLACE FUNCTION public.create_store_with_password(p_name text, p_password text)
+RETURNS json
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid;
+  v_clean_name text;
+  v_store_id uuid;
+BEGIN
+  v_uid := auth.uid();
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'กรุณาเข้าสู่ระบบก่อนสร้างร้านค้า';
+  END IF;
+
+  v_clean_name := trim(COALESCE(p_name, ''));
+  IF v_clean_name = '' THEN
+    RAISE EXCEPTION 'กรุณากรอกชื่อร้านค้า';
+  END IF;
+
+  IF length(COALESCE(p_password, '')) < 1 THEN
+    RAISE EXCEPTION 'กรุณากำหนดรหัสผ่านร้านค้า';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM public.stores WHERE lower(trim(name)) = lower(v_clean_name)) THEN
+    RAISE EXCEPTION 'ชื่อร้านค้า "%" ถูกใช้แล้ว กรุณาใช้ชื่ออื่น', v_clean_name;
+  END IF;
+
+  -- Ensure caller has a profile row
+  INSERT INTO public.profiles (id, email, display_name)
+  SELECT
+    u.id,
+    COALESCE(u.email, ''),
+    COALESCE(NULLIF(trim(u.raw_user_meta_data->>'display_name'), ''), split_part(COALESCE(u.email, 'user'), '@', 1))
+  FROM auth.users u
+  WHERE u.id = v_uid
+  ON CONFLICT (id) DO NOTHING;
+
+  INSERT INTO public.stores (name, store_password, owner_id)
+  VALUES (v_clean_name, p_password, v_uid)
+  RETURNING id INTO v_store_id;
+
+  INSERT INTO public.store_members (store_id, user_id, role, active)
+  VALUES (v_store_id, v_uid, 'owner', true);
+
+  RETURN json_build_object(
+    'store_id', v_store_id,
+    'name', v_clean_name,
+    'role', 'owner',
+    'active', true
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.join_store_with_password(p_name text, p_password text)
+RETURNS json
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_uid uuid;
+  v_clean_name text;
+  v_store record;
+  v_member record;
+BEGIN
+  v_uid := auth.uid();
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'กรุณาเข้าสู่ระบบก่อนเข้าร่วมร้านค้า';
+  END IF;
+
+  v_clean_name := trim(COALESCE(p_name, ''));
+  IF v_clean_name = '' OR COALESCE(p_password, '') = '' THEN
+    RAISE EXCEPTION 'กรุณากรอกชื่อร้านค้าและรหัสผ่านร้านค้า';
+  END IF;
+
+  SELECT id, name, store_password
+  INTO v_store
+  FROM public.stores
+  WHERE lower(trim(name)) = lower(v_clean_name)
+  LIMIT 1;
+
+  IF NOT FOUND OR v_store.store_password <> p_password THEN
+    RAISE EXCEPTION 'ชื่อร้านค้าหรือรหัสผ่านร้านค้าไม่ถูกต้อง';
+  END IF;
+
+  -- Ensure caller has a profile row
+  INSERT INTO public.profiles (id, email, display_name)
+  SELECT
+    u.id,
+    COALESCE(u.email, ''),
+    COALESCE(NULLIF(trim(u.raw_user_meta_data->>'display_name'), ''), split_part(COALESCE(u.email, 'user'), '@', 1))
+  FROM auth.users u
+  WHERE u.id = v_uid
+  ON CONFLICT (id) DO NOTHING;
+
+  INSERT INTO public.store_members (store_id, user_id, role, active)
+  VALUES (v_store.id, v_uid, 'staff', true)
+  ON CONFLICT (store_id, user_id) DO NOTHING;
+
+  SELECT role, active
+  INTO v_member
+  FROM public.store_members
+  WHERE store_id = v_store.id AND user_id = v_uid;
+
+  RETURN json_build_object(
+    'store_id', v_store.id,
+    'name', v_store.name,
+    'role', v_member.role,
+    'active', v_member.active
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.change_store_password(p_store_id uuid, p_new_password text)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NOT public.is_store_owner(p_store_id) THEN
+    RAISE EXCEPTION 'เฉพาะเจ้าของร้านเท่านั้นที่เปลี่ยนรหัสผ่านร้านค้าได้';
+  END IF;
+
+  IF length(COALESCE(p_new_password, '')) < 1 THEN
+    RAISE EXCEPTION 'รหัสผ่านร้านค้าต้องไม่ว่าง';
+  END IF;
+
+  UPDATE public.stores
+  SET store_password = p_new_password
+  WHERE id = p_store_id;
+
+  RETURN true;
+END;
+$$;
+
+-- 9. Enable Row Level Security (RLS)
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.stores ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.store_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.categories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.order_items ENABLE ROW LEVEL SECURITY;
 
--- Profiles policies
+-- Profiles
 DROP POLICY IF EXISTS "profiles_select" ON public.profiles;
 CREATE POLICY "profiles_select" ON public.profiles
-  FOR SELECT USING (auth.uid() = id OR public.is_active_user());
+  FOR SELECT USING (auth.uid() IS NOT NULL);
 
-DROP POLICY IF EXISTS "profiles_update_owner" ON public.profiles;
-CREATE POLICY "profiles_update_owner" ON public.profiles
-  FOR UPDATE USING (public.is_owner()) WITH CHECK (public.is_owner());
+DROP POLICY IF EXISTS "profiles_update_self" ON public.profiles;
+CREATE POLICY "profiles_update_self" ON public.profiles
+  FOR UPDATE USING (auth.uid() = id) WITH CHECK (auth.uid() = id);
 
--- Categories policies
+-- Stores
+DROP POLICY IF EXISTS "stores_select" ON public.stores;
+CREATE POLICY "stores_select" ON public.stores
+  FOR SELECT USING (owner_id = auth.uid() OR public.is_store_member(id));
+
+-- Store Members
+DROP POLICY IF EXISTS "store_members_select" ON public.store_members;
+CREATE POLICY "store_members_select" ON public.store_members
+  FOR SELECT USING (user_id = auth.uid() OR public.is_store_member(store_id));
+
+DROP POLICY IF EXISTS "store_members_update_owner" ON public.store_members;
+CREATE POLICY "store_members_update_owner" ON public.store_members
+  FOR UPDATE USING (public.is_store_owner(store_id)) WITH CHECK (public.is_store_owner(store_id));
+
+DROP POLICY IF EXISTS "store_members_delete_owner" ON public.store_members;
+CREATE POLICY "store_members_delete_owner" ON public.store_members
+  FOR DELETE USING (public.is_store_owner(store_id));
+
+-- Categories
 DROP POLICY IF EXISTS "categories_select" ON public.categories;
 CREATE POLICY "categories_select" ON public.categories
-  FOR SELECT USING (public.is_active_user());
+  FOR SELECT USING (public.is_store_member(store_id));
 
 DROP POLICY IF EXISTS "categories_insert" ON public.categories;
 CREATE POLICY "categories_insert" ON public.categories
-  FOR INSERT WITH CHECK (public.is_active_user());
+  FOR INSERT WITH CHECK (public.is_store_member(store_id));
 
 DROP POLICY IF EXISTS "categories_delete_owner" ON public.categories;
 CREATE POLICY "categories_delete_owner" ON public.categories
-  FOR DELETE USING (public.is_owner());
+  FOR DELETE USING (public.is_store_owner(store_id));
 
--- Products policies
+-- Products
 DROP POLICY IF EXISTS "products_select" ON public.products;
 CREATE POLICY "products_select" ON public.products
-  FOR SELECT USING (public.is_active_user());
+  FOR SELECT USING (public.is_store_member(store_id));
 
 DROP POLICY IF EXISTS "products_insert" ON public.products;
 CREATE POLICY "products_insert" ON public.products
-  FOR INSERT WITH CHECK (public.is_active_user());
+  FOR INSERT WITH CHECK (public.is_store_member(store_id));
 
 DROP POLICY IF EXISTS "products_update" ON public.products;
 CREATE POLICY "products_update" ON public.products
-  FOR UPDATE USING (public.is_active_user()) WITH CHECK (public.is_active_user());
+  FOR UPDATE USING (public.is_store_member(store_id)) WITH CHECK (public.is_store_member(store_id));
 
 DROP POLICY IF EXISTS "products_delete_owner" ON public.products;
 CREATE POLICY "products_delete_owner" ON public.products
-  FOR DELETE USING (public.is_owner());
+  FOR DELETE USING (public.is_store_owner(store_id));
 
--- Orders policies
+-- Orders
 DROP POLICY IF EXISTS "orders_select" ON public.orders;
 CREATE POLICY "orders_select" ON public.orders
-  FOR SELECT USING (public.is_active_user());
+  FOR SELECT USING (public.is_store_member(store_id));
 
 DROP POLICY IF EXISTS "orders_insert" ON public.orders;
 CREATE POLICY "orders_insert" ON public.orders
-  FOR INSERT WITH CHECK (public.is_active_user());
+  FOR INSERT WITH CHECK (public.is_store_member(store_id));
 
 DROP POLICY IF EXISTS "orders_update_owner" ON public.orders;
 CREATE POLICY "orders_update_owner" ON public.orders
-  FOR UPDATE USING (public.is_owner()) WITH CHECK (public.is_owner());
+  FOR UPDATE USING (public.is_store_owner(store_id)) WITH CHECK (public.is_store_owner(store_id));
 
--- Order items policies
+-- Order Items
 DROP POLICY IF EXISTS "order_items_select" ON public.order_items;
 CREATE POLICY "order_items_select" ON public.order_items
-  FOR SELECT USING (public.is_active_user());
+  FOR SELECT USING (public.is_store_member(store_id));
 
 DROP POLICY IF EXISTS "order_items_insert" ON public.order_items;
 CREATE POLICY "order_items_insert" ON public.order_items
-  FOR INSERT WITH CHECK (public.is_active_user());
+  FOR INSERT WITH CHECK (public.is_store_member(store_id));
 
--- 6. Seed Historical Store Data (5 Categories + 68 Products from backup.sql)
-INSERT INTO public.categories (name) VALUES
-  ('ยา'),
-  ('เครื่องดื่ม'),
-  ('อาหาร'),
-  ('บุหรี่'),
-  ('ของใช้')
-ON CONFLICT (name) DO NOTHING;
+-- 10. Explicit Postgres Grants (Fixes "permission denied for table categories" & all tables)
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO anon, authenticated, service_role;
 
-INSERT INTO public.products (barcode, name, price, cost_price, stock_qty, low_stock_threshold, category) VALUES
-  ('8851932354516', 'ซันซิลขวด', 20.00, 15.00, 24, 5, 'ของใช้'),
-  ('8850188900058', 'โฟร์โมสต์แพ็ค', 40.00, 30.00, 24, 5, 'เครื่องดื่ม'),
-  ('8859361300258', 'เหล้าข้าวหอมขวดเล็ก', 65.00, 48.75, 24, 5, 'เครื่องดื่ม'),
-  ('8859361300296', 'เหล้าข้าวหมอขวดใหญ่', 105.00, 78.75, 24, 5, 'เครื่องดื่ม'),
-  ('8851993616059', 'เบียร์ช้างลัง', 630.00, 472.50, 24, 5, 'เครื่องดื่ม'),
-  ('8850999141015', 'เบียร์ลีโอลัง', 645.00, 483.75, 24, 5, 'เครื่องดื่ม'),
-  ('8850999111018', 'เบียร์สิงห์ลัง', 695.00, 521.25, 24, 5, 'เครื่องดื่ม'),
-  ('8850999014616', 'เบียร์สิงห์กระป๋องยาว', 55.00, 41.25, 24, 5, 'เครื่องดื่ม'),
-  ('8850999320007', 'น้ำสิงห์ขวด', 15.00, 11.25, 24, 5, 'เครื่องดื่ม'),
-  ('8854786000370', 'เหล้าขาวขวดใหญ่', 105.00, 78.75, 24, 5, 'เครื่องดื่ม'),
-  ('8858992504301', 'Finasteride', 290.00, 217.50, 24, 5, 'ยา'),
-  ('8850250007425', 'เบอร์ดี้แดง27ซอง', 100.00, 75.00, 24, 5, 'เครื่องดื่ม'),
-  ('8850250007449', 'เบอร์ดี้เขียว27ซอง', 100.00, 75.00, 24, 5, 'เครื่องดื่ม'),
-  ('8850170000797', 'บุหรี่ SMS แดงซอง', 70.00, 52.50, 24, 5, 'บุหรี่'),
-  ('8851717901799', 'นมเปรี้ยวดีไลท์', 10.00, 7.50, 24, 5, 'เครื่องดื่ม'),
-  ('8850250000365', 'เบอร์ดี้แดงกระป๋อง', 17.00, 12.75, 24, 5, 'เครื่องดื่ม'),
-  ('8850999113005', 'เบียร์สิงห์กระป๋องสั้น', 38.00, 28.50, 24, 5, 'เครื่องดื่ม'),
-  ('8850999009674', 'เบียร์ลีโอกระป๋องยาว', 50.00, 37.50, 24, 5, 'เครื่องดื่ม'),
-  ('8851123237079', 'ซีวิตแดงแพ็ค', 135.00, 101.25, 24, 5, ''),
-  ('8854786000417', 'เหล้าขาวขวดเล็ก', 65.00, 48.75, 24, 5, 'เครื่องดื่ม'),
-  ('8851959142011', 'โค้กขวด 2 ลิตร', 40.00, 30.00, 24, 5, 'เครื่องดื่ม'),
-  ('8851959144015', 'โค้กขวด 1.5 ลิตร', 30.00, 22.50, 24, 5, 'เครื่องดื่ม'),
-  ('8851993625013', 'เบียร์ช้างกระป๋องยาว', 50.00, 37.50, 24, 5, 'เครื่องดื่ม'),
-  ('8851993623019', 'เบียร์ช้างกระป๋องสั้น', 35.00, 26.25, 24, 5, 'เครื่องดื่ม'),
-  ('8850999143002', 'เบียร์ลีโอกระป๋องสั้น', 35.00, 26.25, 24, 5, 'เครื่องดื่ม'),
-  ('8850425004532', 'ปีโป้ห่อ', 25.00, 18.75, 24, 5, 'อาหาร'),
-  ('8850250000358', 'เบอร์ดี้ลาเต้', 17.00, 12.75, 24, 5, 'เครื่องดื่ม'),
-  ('8850424001471', 'สาหร่ายตี๋เล็กซอง', 5.00, 3.75, 24, 5, 'อาหาร'),
-  ('8850170000803', 'บุหรี่ SMS เขียวซอง', 70.00, 52.50, 24, 5, 'บุหรี่'),
-  ('8850170001794', 'บุหรี่ Wonder S แดงซอง', 70.00, 52.50, 24, 5, 'บุหรี่'),
-  ('8850170001800', 'บุหรี่ Wonder S เขียวซอง', 70.00, 52.50, 24, 5, 'บุหรี่'),
-  ('8852388000620', 'เหล้าหงส์ทองแบน', 150.00, 112.50, 24, 5, 'เครื่องดื่ม'),
-  ('8858638007067', 'บิ๊กโคล่า 360 มล.', 10.00, 7.50, 24, 5, 'เครื่องดื่ม'),
-  ('8855790000011', 'คาราบาวแดงขวด', 10.00, 7.50, 24, 5, 'เครื่องดื่ม'),
-  ('4', 'น้ำแข็งกระสอบใส่เอง', 45.00, 33.75, 24, 5, 'เครื่องดื่ม'),
-  ('5', 'น้ำแข็งกระสอบใส่ถุง', 55.00, 41.25, 24, 5, 'เครื่องดื่ม'),
-  ('3', 'น้ำแข็ง 20 บาท', 20.00, 15.00, 24, 5, 'เครื่องดื่ม'),
-  ('2', 'น้ำแข็ง 10 บาท', 10.00, 7.50, 24, 5, 'เครื่องดื่ม'),
-  ('1', 'น้ำแข็ง 5 บาท', 5.00, 3.75, 24, 5, 'เครื่องดื่ม'),
-  ('8850250014980', 'ชูรสซอง 250 กรัม.', 32.00, 24.00, 24, 5, 'อาหาร'),
-  ('8850250010944', 'รสดีซอง 155 กรัม', 27.00, 20.25, 24, 5, 'อาหาร'),
-  ('8851959158166', 'แฟนต้าส้ม ขวด 450 มล.', 16.00, 12.00, 24, 5, 'เครื่องดื่ม'),
-  ('8850423000093', 'เฮลบลูบอยขวด', 70.00, 52.50, 24, 5, 'เครื่องดื่ม'),
-  ('8996001358306', 'ขนมวาเฟโร', 5.00, 3.75, 24, 5, 'อาหาร'),
-  ('8858891310027', 'อิชิตันขวด', 10.00, 7.50, 24, 5, 'เครื่องดื่ม'),
-  ('8850002022805', 'ผงซักฟอก 3 แจ๋ว 300 กรัม', 20.00, 15.00, 24, 5, 'ของใช้'),
-  ('9555192501879', 'หมากฝรั่งดับเบิ้ลมินต์ แบบแพ็ค', 100.00, 75.00, 24, 5, 'อาหาร'),
-  ('8851959004661', 'แฟนต้าส้มขวด 245 มล.', 10.00, 7.50, 24, 5, 'เครื่องดื่ม'),
-  ('8436556777493', 'ก้นกรองเย็นกล่อง', 50.00, 37.50, 24, 5, 'บุหรี่'),
-  ('8851959144169', 'แฟนต้าส้มขวด 1.25 ลิตร', 30.00, 22.50, 24, 5, 'เครื่องดื่ม'),
-  ('8851959144183', 'แฟนต้าเขียวขวด 1.25 ลิตร', 30.00, 22.50, 24, 5, 'เครื่องดื่ม'),
-  ('8851959144176', 'แฟนต้าแดงขวด 1.25 ลิตร', 30.00, 22.50, 24, 5, 'เครื่องดื่ม'),
-  ('8850127004397', 'เนสกาแฟแดง 27 ซอง', 115.00, 86.25, 24, 5, 'เครื่องดื่ม'),
-  ('8850127004410', 'เนสกาแฟเขียว 27 ซอง', 115.00, 86.25, 24, 5, 'เครื่องดื่ม'),
-  ('8851959139714', 'น้ำทิพย์ขวดเล็ก', 5.00, 3.75, 24, 5, 'เครื่องดื่ม'),
-  ('8858998581306', 'เป็ปซี่ขวด 640 มล.', 19.00, 14.25, 24, 5, 'เครื่องดื่ม'),
-  ('8851959144367', 'สไปรต์ขวด 1.25 ลิตร', 30.00, 22.50, 24, 5, 'เครื่องดื่ม'),
-  ('8858998581238', 'เป็ปซี่ขวด 1.5 ลิตร', 30.00, 22.50, 24, 5, ''),
-  ('8858998583607', 'เป็ปซี่ขวด 2 ลิตร', 40.00, 30.00, 24, 5, 'เครื่องดื่ม'),
-  ('8850425003214', 'ขนม5บาท', 5.00, 3.75, 24, 5, 'อาหาร'),
-  ('8852965100033', 'เสือ11ตัวซอง', 20.00, 15.00, 24, 5, 'ยา'),
-  ('8850188800051', 'โฟร์โมสต์กล่อง', 10.00, 7.50, 24, 5, 'เครื่องดื่ม'),
-  ('8851717040023', 'ดัชมิลล์รสส้มแบบกล่อง', 10.00, 7.50, 24, 5, 'เครื่องดื่ม'),
-  ('95509747', 'บุหรี่ LM เขียวแบบซอง', 70.00, 52.50, 24, 5, 'บุหรี่'),
-  ('8851993616011', 'ช้างขวด', 60.00, 45.00, 24, 5, 'เครื่องดื่ม'),
-  ('8850124083111', 'เนสกาแฟเขียว 60 ซอง', 230.00, 172.50, 24, 5, 'เครื่องดื่ม'),
-  ('8850124083081', 'เนสกาแฟแดง 60 ซอง', 230.00, 172.50, 24, 5, 'เครื่องดื่ม'),
-  ('8436556777615', 'ก้นกรองแดง 250 มวน', 100.00, 75.00, 24, 5, 'บุหรี่')
-ON CONFLICT (barcode) DO NOTHING;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;

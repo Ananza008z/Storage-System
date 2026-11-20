@@ -11,6 +11,11 @@ import {
   getLocalUsersStore,
   getLocalSessionUserId,
   setLocalSessionUserId,
+  getActiveStoreId,
+  setActiveStoreId,
+  getMyStores,
+  createStore,
+  joinStore,
 } from '../api.js';
 
 const AuthContext = createContext(null);
@@ -18,6 +23,9 @@ const AuthContext = createContext(null);
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [profile, setProfile] = useState(null);
+  const [stores, setStores] = useState([]);
+  const [currentStore, setCurrentStore] = useState(null);
+  const [choosingStore, setChoosingStore] = useState(false);
   const [mode, setMode] = useState(() => (isCloudActive() ? 'cloud' : 'local'));
   const [loading, setLoading] = useState(true);
 
@@ -38,9 +46,35 @@ export function AuthProvider({ children }) {
       display_name:
         authUser.user_metadata?.display_name ||
         (authUser.email || 'user').split('@')[0],
-      role: authUser.user_metadata?.role === 'owner' ? 'owner' : 'staff',
-      active: true,
     };
+  }, []);
+
+  const syncStoresForUser = useCallback(async (userId, preferredStoreId = null) => {
+    if (!userId) {
+      setStores([]);
+      setCurrentStore(null);
+      return [];
+    }
+    try {
+      const list = await getMyStores(userId);
+      setStores(list);
+      const targetId = preferredStoreId || getActiveStoreId();
+      let selected = list.find((s) => s.id === targetId) || null;
+      if (!selected && list.length === 1) {
+        selected = list[0];
+      }
+      if (selected) {
+        setActiveStoreId(selected.id);
+      } else {
+        setActiveStoreId('');
+      }
+      setCurrentStore(selected);
+      return list;
+    } catch {
+      setStores([]);
+      setCurrentStore(null);
+      return [];
+    }
   }, []);
 
   const refreshAuth = useCallback(async () => {
@@ -55,9 +89,12 @@ export function AuthProvider({ children }) {
           const prof = await loadProfileForCloudUser(session.user);
           setUser(session.user);
           setProfile(prof);
+          await syncStoresForUser(session.user.id);
         } else {
           setUser(null);
           setProfile(null);
+          setStores([]);
+          setCurrentStore(null);
         }
       } else {
         const savedId = getLocalSessionUserId();
@@ -68,23 +105,30 @@ export function AuthProvider({ children }) {
             const { password: _pw, ...safe } = hit;
             setUser(safe);
             setProfile(safe);
+            await syncStoresForUser(safe.id);
           } else {
             setLocalSessionUserId('');
             setUser(null);
             setProfile(null);
+            setStores([]);
+            setCurrentStore(null);
           }
         } else {
           setUser(null);
           setProfile(null);
+          setStores([]);
+          setCurrentStore(null);
         }
       }
     } catch {
       setUser(null);
       setProfile(null);
+      setStores([]);
+      setCurrentStore(null);
     } finally {
       setLoading(false);
     }
-  }, [loadProfileForCloudUser]);
+  }, [loadProfileForCloudUser, syncStoresForUser]);
 
   useEffect(() => {
     refreshAuth();
@@ -102,6 +146,8 @@ export function AuthProvider({ children }) {
       setMode('cloud');
       setUser(session.user);
       setProfile(prof);
+      setChoosingStore(false);
+      await syncStoresForUser(session.user.id);
       return prof;
     }
 
@@ -117,6 +163,8 @@ export function AuthProvider({ children }) {
     setMode('local');
     setUser(safe);
     setProfile(safe);
+    setChoosingStore(false);
+    await syncStoresForUser(safe.id);
     return safe;
   };
 
@@ -134,6 +182,8 @@ export function AuthProvider({ children }) {
         setMode('cloud');
         setUser(data.user);
         setProfile(prof);
+        setChoosingStore(false);
+        await syncStoresForUser(data.user.id);
         return { loggedIn: true, profile: prof };
       }
       return {
@@ -151,18 +201,54 @@ export function AuthProvider({ children }) {
       email: cleanEmail,
       password,
       display_name: cleanName,
-      role: users.length === 0 ? 'owner' : 'staff',
-      active: true,
       created_at: new Date().toISOString(),
     };
     users.push(newUser);
-    localStorage.setItem('store_local_users', JSON.stringify(users));
-    const { password: _pw, ...safe } = newUser;
-    setLocalSessionUserId(safe.id);
+    localStorage.setItem('store_local_users_v2', JSON.stringify(users));
+    setLocalSessionUserId(newUser.id);
     setMode('local');
-    setUser(safe);
-    setProfile(safe);
-    return { loggedIn: true, profile: safe };
+    setUser(newUser);
+    setProfile(newUser);
+    setChoosingStore(false);
+    await syncStoresForUser(newUser.id);
+    return { loggedIn: true, profile: newUser };
+  };
+
+  const selectStore = (storeId) => {
+    const found = stores.find((s) => s.id === storeId) || null;
+    if (found) {
+      setActiveStoreId(found.id);
+      setCurrentStore(found);
+      setChoosingStore(false);
+    }
+  };
+
+  const refreshStores = async (preferredStoreId = null) => {
+    if (!user?.id) return [];
+    return syncStoresForUser(user.id, preferredStoreId);
+  };
+
+  const createNewStore = async ({ name, password, seedDefaultData = true }) => {
+    const created = await createStore({
+      name,
+      password,
+      seedDefaultData,
+      user: profile || user,
+    });
+    await syncStoresForUser(user.id, created.id);
+    setChoosingStore(false);
+    return created;
+  };
+
+  const joinExistingStore = async ({ name, password }) => {
+    const joined = await joinStore({
+      name,
+      password,
+      user: profile || user,
+    });
+    await syncStoresForUser(user.id, joined.id);
+    setChoosingStore(false);
+    return joined;
   };
 
   const logout = async () => {
@@ -171,21 +257,33 @@ export function AuthProvider({ children }) {
     } else {
       setLocalSessionUserId('');
     }
+    setActiveStoreId('');
     setUser(null);
     setProfile(null);
+    setStores([]);
+    setCurrentStore(null);
+    setChoosingStore(false);
   };
 
   const value = {
     user,
     profile,
-    isOwner: profile?.role === 'owner',
-    isActive: profile ? profile.active !== false : false,
+    stores,
+    currentStore,
+    choosingStore,
+    setChoosingStore,
+    isOwner: currentStore?.role === 'owner',
+    isActive: currentStore ? currentStore.active !== false : true,
     mode,
     loading,
     login,
     register,
     logout,
     refreshAuth,
+    selectStore,
+    refreshStores,
+    createNewStore,
+    joinExistingStore,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

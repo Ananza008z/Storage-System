@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   getTeamMembers,
   updateTeamMember,
-  createTeamMember,
+  removeTeamMember,
+  updateStorePassword,
   syncLocalDataToCloud,
   setForcedLocalMode,
   getForcedLocalMode,
@@ -18,20 +19,16 @@ import { useAuth } from '../context/AuthContext.jsx';
 import schemaSql from '../../supabase/schema_and_seed.sql?raw';
 
 export default function TeamSettings() {
-  const { profile, isOwner, mode, refreshAuth } = useAuth();
+  const { user, currentStore, isOwner, mode, refreshAuth, setChoosingStore } =
+    useAuth();
 
   const [members, setMembers] = useState([]);
   const [loadingMembers, setLoadingMembers] = useState(true);
   const [msg, setMsg] = useState({ type: '', text: '' });
 
-  // Add new staff form
-  const [newUser, setNewUser] = useState({
-    display_name: '',
-    email: '',
-    password: '',
-    role: 'staff',
-  });
-  const [creating, setCreating] = useState(false);
+  // Store password update
+  const [newStorePass, setNewStorePass] = useState('');
+  const [savingPass, setSavingPass] = useState(false);
 
   // Cloud config form
   const currentCfg = getCloudConfig();
@@ -43,6 +40,7 @@ export default function TeamSettings() {
   const [copied, setCopied] = useState(false);
 
   const loadMembers = useCallback(async () => {
+    if (!currentStore?.id) return;
     setLoadingMembers(true);
     try {
       const list = await getTeamMembers();
@@ -52,14 +50,33 @@ export default function TeamSettings() {
     } finally {
       setLoadingMembers(false);
     }
-  }, []);
+  }, [currentStore?.id]);
 
   useEffect(() => {
     loadMembers();
   }, [loadMembers, mode]);
 
+  const handleChangeStorePass = async (e) => {
+    e.preventDefault();
+    if (!isOwner || !newStorePass.trim()) return;
+    setSavingPass(true);
+    setMsg({ type: '', text: '' });
+    try {
+      await updateStorePassword(currentStore.id, newStorePass);
+      setNewStorePass('');
+      setMsg({
+        type: 'ok',
+        text: 'เปลี่ยนรหัสผ่านร้านค้าเรียบร้อย พนักงานใหม่ใช้ชื่อร้านและรหัสนี้เข้าร่วมได้ทันที',
+      });
+    } catch (err) {
+      setMsg({ type: 'err', text: err.message || 'เปลี่ยนรหัสผ่านร้านค้าไม่สำเร็จ' });
+    } finally {
+      setSavingPass(false);
+    }
+  };
+
   const handleRoleToggle = async (member) => {
-    if (!isOwner || member.id === profile?.id) return;
+    if (!isOwner || member.user_id === user?.id) return;
     const nextRole = member.role === 'owner' ? 'staff' : 'owner';
     try {
       await updateTeamMember(member.id, { role: nextRole });
@@ -78,7 +95,7 @@ export default function TeamSettings() {
   };
 
   const handleActiveToggle = async (member) => {
-    if (!isOwner || member.id === profile?.id) return;
+    if (!isOwner || member.user_id === user?.id) return;
     const nextActive = member.active === false;
     try {
       await updateTeamMember(member.id, { active: nextActive });
@@ -90,25 +107,16 @@ export default function TeamSettings() {
     }
   };
 
-  const handleCreateUser = async (e) => {
-    e.preventDefault();
-    if (!isOwner) return;
-    setCreating(true);
-    setMsg({ type: '', text: '' });
+  const handleRemoveMember = async (member) => {
+    if (!isOwner || member.user_id === user?.id) return;
+    if (!window.confirm(`นำ "${member.display_name}" ออกจากร้าน "${currentStore?.name}"?`)) {
+      return;
+    }
     try {
-      const created = await createTeamMember(newUser);
-      setNewUser({ display_name: '', email: '', password: '', role: 'staff' });
-      setMsg({
-        type: 'ok',
-        text: created.needsEmailConfirm
-          ? `สร้างบัญชี ${created.email} แล้ว (ผู้ใช้ต้องยืนยันอีเมลก่อนเข้าใช้งาน)`
-          : `เพิ่มบัญชี ${created.display_name} (${created.email}) เรียบร้อย`,
-      });
-      loadMembers();
+      await removeTeamMember(member.id);
+      setMembers((prev) => prev.filter((m) => m.id !== member.id));
     } catch (err) {
-      setMsg({ type: 'err', text: err.message || 'สร้างบัญชีไม่สำเร็จ' });
-    } finally {
-      setCreating(false);
+      setMsg({ type: 'err', text: err.message || 'ไม่สามารถนำสมาชิกออกได้' });
     }
   };
 
@@ -143,17 +151,17 @@ export default function TeamSettings() {
     setSyncing(true);
     setMsg({ type: '', text: '' });
     try {
-      const res = await syncLocalDataToCloud();
+      const res = await syncLocalDataToCloud(currentStore?.id, false);
       setMsg({
         type: 'ok',
-        text: `อัปโหลดข้อมูลขึ้น Supabase Cloud สำเร็จ! (${res.categoriesCount} หมวดหมู่, ${res.productsCount} สินค้า)`,
+        text: `อัปโหลดข้อมูลเข้าร้าน "${currentStore?.name}" สำเร็จ! (${res.categoriesCount} หมวดหมู่, ${res.productsCount} สินค้า)`,
       });
     } catch (err) {
       setMsg({
         type: 'err',
         text:
           err.message ||
-          'อัปโหลดไม่สำเร็จ กรุณาตรวจสอบว่าได้ล็อกอินด้วยบัญชี Supabase Cloud และรัน SQL Schema แล้ว',
+          'อัปโหลดไม่สำเร็จ กรุณาตรวจสอบว่าได้ล็อกอินและรัน SQL Schema ล่าสุดแล้ว',
       });
     } finally {
       setSyncing(false);
@@ -191,17 +199,70 @@ export default function TeamSettings() {
         </div>
       )}
 
-      {/* Section 1: Team & Roles */}
+      {/* Section 1: Current Store & Password */}
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 space-y-4">
+        <div className="flex items-start justify-between gap-2 flex-wrap">
+          <div>
+            <p className="text-xs text-gray-400">ร้านค้าที่กำลังใช้งาน</p>
+            <h2 className="text-lg font-bold text-gray-800">{currentStore?.name}</h2>
+            <p className="text-xs text-green-700 font-medium mt-0.5">
+              สิทธิ์ของคุณในร้านนี้: {isOwner ? 'เจ้าของร้าน (Owner)' : 'พนักงานขาย (Staff)'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setChoosingStore(true)}
+            className="text-xs px-3.5 py-2 rounded-xl border border-green-200 bg-green-50 text-green-800 hover:bg-green-100 font-semibold"
+          >
+            สลับร้านค้า / สร้างร้านเพิ่ม
+          </button>
+        </div>
+
+        {isOwner && (
+          <form
+            onSubmit={handleChangeStorePass}
+            className="border-t border-gray-100 pt-3.5 space-y-2"
+          >
+            <p className="text-xs font-semibold text-gray-700">
+              เปลี่ยนรหัสผ่านร้านค้า (สำหรับให้พนักงานกรอกเข้าร่วมร้าน)
+            </p>
+            <p className="text-[11px] text-gray-400">
+              วิธีเพิ่มพนักงาน: ให้พนักงานสมัครบัญชีของตัวเอง แล้วกด "เข้าร่วมร้านค้า" โดยใช้ชื่อร้าน{' '}
+              <span className="font-semibold text-gray-600">"{currentStore?.name}"</span>{' '}
+              พร้อมรหัสผ่านร้านนี้
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={newStorePass}
+                onChange={(e) => setNewStorePass(e.target.value)}
+                placeholder="รหัสผ่านร้านค้าใหม่..."
+                required
+                className="flex-1 px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-green-600"
+              />
+              <button
+                type="submit"
+                disabled={savingPass || !newStorePass}
+                className="px-4 py-2 rounded-lg bg-green-700 hover:bg-green-800 text-white text-xs font-semibold disabled:opacity-40 whitespace-nowrap"
+              >
+                {savingPass ? 'กำลังบันทึก...' : 'อัปเดตรหัสผ่านร้าน'}
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
+
+      {/* Section 2: Store Members & Roles */}
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 space-y-4">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-base font-bold text-gray-800">จัดการบัญชีและสิทธิ์พนักงาน</h2>
+            <h2 className="text-base font-bold text-gray-800">สมาชิกและพนักงานในร้านนี้</h2>
             <p className="text-xs text-gray-400">
-              1 ร้านค้า • แยกสิทธิ์เจ้าของร้าน (Owner) และพนักงานขาย (Staff)
+              จัดการสิทธิ์เจ้าของร้าน (Owner) และพนักงาน (Staff) เฉพาะร้าน {currentStore?.name}
             </p>
           </div>
           <span className="text-xs bg-green-50 text-green-700 px-2.5 py-1 rounded-full font-medium">
-            {members.length} บัญชี
+            {members.length} คน
           </span>
         </div>
 
@@ -212,7 +273,7 @@ export default function TeamSettings() {
         ) : (
           <div className="divide-y divide-gray-100">
             {members.map((m) => {
-              const isSelf = m.id === profile?.id;
+              const isSelf = m.user_id === user?.id;
               const isUserOwner = m.role === 'owner';
               const active = m.active !== false;
               return (
@@ -237,11 +298,11 @@ export default function TeamSettings() {
                             : 'bg-blue-50 text-blue-700'
                         }`}
                       >
-                        {isUserOwner ? 'เจ้าของร้าน (Owner)' : 'พนักงานขาย (Staff)'}
+                        {isUserOwner ? 'เจ้าของร้าน (Owner)' : 'พนักงาน (Staff)'}
                       </span>
                       {!active && (
                         <span className="text-[11px] px-2 py-0.5 rounded-full bg-red-100 text-red-700 font-medium">
-                          ระงับการใช้งาน
+                          ระงับสิทธิ์
                         </span>
                       )}
                     </div>
@@ -249,24 +310,31 @@ export default function TeamSettings() {
                   </div>
 
                   {isOwner && !isSelf && (
-                    <div className="flex gap-2 shrink-0">
+                    <div className="flex gap-1.5 shrink-0 flex-wrap">
                       <button
                         type="button"
                         onClick={() => handleRoleToggle(m)}
-                        className="text-xs px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 font-medium"
+                        className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 font-medium"
                       >
                         สลับเป็น {isUserOwner ? 'Staff' : 'Owner'}
                       </button>
                       <button
                         type="button"
                         onClick={() => handleActiveToggle(m)}
-                        className={`text-xs px-3 py-1.5 rounded-lg border font-medium ${
+                        className={`text-xs px-2.5 py-1.5 rounded-lg border font-medium ${
                           active
-                            ? 'border-red-100 text-red-600 hover:bg-red-50'
+                            ? 'border-amber-200 text-amber-700 hover:bg-amber-50'
                             : 'border-green-200 text-green-700 hover:bg-green-50'
                         }`}
                       >
-                        {active ? 'ระงับบัญชี' : 'เปิดใช้งาน'}
+                        {active ? 'ระงับสิทธิ์' : 'เปิดสิทธิ์'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveMember(m)}
+                        className="text-xs px-2.5 py-1.5 rounded-lg border border-red-100 text-red-500 hover:bg-red-50 font-medium"
+                      >
+                        ลบออก
                       </button>
                     </div>
                   )}
@@ -275,61 +343,9 @@ export default function TeamSettings() {
             })}
           </div>
         )}
-
-        {/* Create new user form (Owner only) */}
-        {isOwner && (
-          <form
-            onSubmit={handleCreateUser}
-            className="border-t border-gray-100 pt-4 space-y-3"
-          >
-            <p className="text-xs font-semibold text-gray-600">+ เพิ่มบัญชีพนักงานใหม่</p>
-            <div className="grid sm:grid-cols-2 gap-2">
-              <input
-                value={newUser.display_name}
-                onChange={(e) =>
-                  setNewUser((u) => ({ ...u, display_name: e.target.value }))
-                }
-                placeholder="ชื่อพนักงาน *"
-                required
-                className="px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-green-600"
-              />
-              <input
-                type="email"
-                value={newUser.email}
-                onChange={(e) => setNewUser((u) => ({ ...u, email: e.target.value }))}
-                placeholder="อีเมลสำหรับเข้าสู่ระบบ *"
-                required
-                className="px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-green-600"
-              />
-              <input
-                type="password"
-                value={newUser.password}
-                onChange={(e) => setNewUser((u) => ({ ...u, password: e.target.value }))}
-                placeholder="รหัสผ่าน (อย่างน้อย 6 ตัว) *"
-                required
-                className="px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-green-600"
-              />
-              <select
-                value={newUser.role}
-                onChange={(e) => setNewUser((u) => ({ ...u, role: e.target.value }))}
-                className="px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:border-green-600"
-              >
-                <option value="staff">พนักงานขาย (Staff)</option>
-                <option value="owner">เจ้าของร้าน (Owner)</option>
-              </select>
-            </div>
-            <button
-              type="submit"
-              disabled={creating}
-              className="px-4 py-2 rounded-lg bg-green-700 hover:bg-green-800 text-white text-xs font-semibold disabled:opacity-50"
-            >
-              {creating ? 'กำลังสร้างบัญชี...' : 'สร้างบัญชีผู้ใช้'}
-            </button>
-          </form>
-        )}
       </div>
 
-      {/* Section 2: Cloud Connection & SQL Migration */}
+      {/* Section 3: Cloud Connection & SQL Migration */}
       <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 space-y-4">
         <div className="flex items-center justify-between flex-wrap gap-2">
           <div>
@@ -375,11 +391,13 @@ export default function TeamSettings() {
             />
           </div>
           <div>
-            <label className="text-xs text-gray-500 block mb-1">Supabase Anon Key</label>
+            <label className="text-xs text-gray-500 block mb-1">
+              Supabase Publishable / Anon Key
+            </label>
             <input
               value={cloudKey}
               onChange={(e) => setCloudKey(e.target.value)}
-              placeholder="eyJhbGciOiJIUzI1NiIs..."
+              placeholder="sb_publishable_... หรือ eyJ..."
               disabled={currentCfg.source === 'env'}
               className="w-full px-3 py-2 rounded-lg border border-gray-200 text-sm font-mono disabled:bg-gray-50 focus:outline-none focus:border-green-600"
             />
@@ -425,10 +443,10 @@ export default function TeamSettings() {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
             <div>
               <p className="text-sm font-semibold text-gray-700">
-                ย้ายข้อมูลสินค้า 68 รายการขึ้น Supabase Cloud
+                สคริปต์ฐานข้อมูล Multi-Store & ย้ายสินค้า 68 รายการ
               </p>
               <p className="text-xs text-gray-400">
-                1) รันสคริปต์ SQL ใน Supabase SQL Editor • 2) กดปุ่มอัปโหลดข้อมูลสินค้าขึ้น Cloud
+                รันสคริปต์ SQL ด้านล่างใน Supabase SQL Editor เพื่อสร้างตาราง Multi-Store และแก้สิทธิ์ตารางทั้งหมด
               </p>
             </div>
             <div className="flex gap-2 shrink-0">
@@ -449,16 +467,18 @@ export default function TeamSettings() {
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={handleSyncToCloud}
-            disabled={syncing || !isCloudConfigured()}
-            className="w-full py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold disabled:opacity-40 transition-colors"
-          >
-            {syncing
-              ? 'กำลังอัปโหลดข้อมูลขึ้น Cloud...'
-              : 'อัปโหลดข้อมูลสินค้า 68 รายการขึ้น Cloud (Sync Now)'}
-          </button>
+          {isOwner && (
+            <button
+              type="button"
+              onClick={handleSyncToCloud}
+              disabled={syncing || !isCloudConfigured()}
+              className="w-full py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold disabled:opacity-40 transition-colors"
+            >
+              {syncing
+                ? 'กำลังอัปโหลดข้อมูลเข้าร้าน...'
+                : 'อัปโหลดสินค้า 68 รายการเข้าร้านนี้ (Sync Now)'}
+            </button>
+          )}
 
           {showSql && (
             <div className="bg-gray-900 text-gray-100 rounded-xl p-3 overflow-x-auto max-h-72 overflow-y-auto">

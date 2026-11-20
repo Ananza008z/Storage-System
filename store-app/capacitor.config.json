@@ -1,0 +1,8 @@
+{
+  "appId": "com.storesystem.pos",
+  "appName": "ระบบร้านค้า POS",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
+}

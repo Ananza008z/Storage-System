@@ -1,13 +1,21 @@
 {
   "name": "store-app",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "cap:init": "npx @capacitor/cli init",
+    "cap:add:android": "npx @capacitor/cli add android",
+    "cap:add:ios": "npx @capacitor/cli add ios",
+    "cap:sync": "npm run build && npx @capacitor/cli sync",
+    "cap:android": "npx @capacitor/cli open android"
   },
   "dependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/cli": "^8.6.2",
+    "@capacitor/core": "^8.6.2",
     "@zxing/library": "^0.21.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"

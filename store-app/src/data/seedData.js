@@ -71,7 +71,39 @@ const RAW_PRODUCTS = [
   ['8436556777615', 'ก้นกรองแดง 250 มวน', 100, 'บุหรี่', '2026-05-11T12:09:58Z'],
 ];
 
+export const DEFAULT_LOCAL_STORE_ID = 'local-store-1';
+
+export const SEED_STORES = [
+  {
+    id: DEFAULT_LOCAL_STORE_ID,
+    name: 'ร้านค้าสาธิต (Demo Store)',
+    store_password: '1234',
+    owner_id: 'local-owner-1',
+    created_at: '2026-05-08T00:00:00Z',
+  },
+];
+
+export const SEED_STORE_MEMBERS = [
+  {
+    id: 1,
+    store_id: DEFAULT_LOCAL_STORE_ID,
+    user_id: 'local-owner-1',
+    role: 'owner',
+    active: true,
+    created_at: '2026-05-08T00:00:00Z',
+  },
+  {
+    id: 2,
+    store_id: DEFAULT_LOCAL_STORE_ID,
+    user_id: 'local-staff-1',
+    role: 'staff',
+    active: true,
+    created_at: '2026-05-08T00:00:00Z',
+  },
+];
+
 export const SEED_PRODUCTS = RAW_PRODUCTS.map(([barcode, name, price, category, createdAt]) => ({
+  store_id: DEFAULT_LOCAL_STORE_ID,
   barcode,
   name,
   price,
@@ -190,6 +222,7 @@ export function buildSeedOrders() {
     } else {
       current = {
         id: `seed-order-${orderCounter}`,
+        store_id: DEFAULT_LOCAL_STORE_ID,
         order_no: orderCounter,
         cashier_id: 'local-owner-1',
         cashier_name: 'เจ้าของร้าน (ข้อมูลเดิม)',

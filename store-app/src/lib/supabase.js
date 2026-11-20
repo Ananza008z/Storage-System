@@ -275,6 +275,13 @@ export async function restDelete(table, queryParams = {}) {
   });
 }
 
+export async function restRpc(fnName, body = {}) {
+  return authorizedFetch(`/rest/v1/rpc/${fnName}`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
 export async function testCloudConnection(testUrl, testAnonKey) {
   const cleanUrl = (testUrl || '').trim().replace(/\/+$/, '');
   const cleanKey = (testAnonKey || '').trim();

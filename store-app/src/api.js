@@ -1,25 +1,31 @@
 import {
+  DEFAULT_LOCAL_STORE_ID,
   SEED_CATEGORIES,
   SEED_PRODUCTS,
+  SEED_STORES,
+  SEED_STORE_MEMBERS,
   SEED_USERS,
   buildSeedOrders,
 } from './data/seedData.js';
 import {
   isCloudConfigured,
-  cloudAdminInviteSignUp,
   restGet,
   restPost,
   restPatch,
   restDelete,
+  restRpc,
 } from './lib/supabase.js';
 
 const KEYS = {
-  PRODUCTS: 'store_local_products',
-  CATEGORIES: 'store_local_categories',
-  ORDERS: 'store_local_orders',
-  USERS: 'store_local_users',
+  PRODUCTS: 'store_local_products_v2',
+  CATEGORIES: 'store_local_categories_v2',
+  ORDERS: 'store_local_orders_v2',
+  USERS: 'store_local_users_v2',
+  STORES: 'store_local_stores_v2',
+  MEMBERS: 'store_local_members_v2',
   LOCAL_SESSION: 'store_local_session',
-  PRODUCTS_CACHE: 'store_products_cache',
+  ACTIVE_STORE: 'store_active_store_id',
+  PRODUCTS_CACHE: 'store_products_cache_v2',
   FORCE_LOCAL: 'store_force_local_mode',
 };
 
@@ -28,15 +34,21 @@ export function getForcedLocalMode() {
 }
 
 export function setForcedLocalMode(enabled) {
-  if (enabled) {
-    localStorage.setItem(KEYS.FORCE_LOCAL, '1');
-  } else {
-    localStorage.removeItem(KEYS.FORCE_LOCAL);
-  }
+  if (enabled) localStorage.setItem(KEYS.FORCE_LOCAL, '1');
+  else localStorage.removeItem(KEYS.FORCE_LOCAL);
 }
 
 export function isCloudActive() {
   return isCloudConfigured() && !getForcedLocalMode();
+}
+
+export function getActiveStoreId() {
+  return localStorage.getItem(KEYS.ACTIVE_STORE) || '';
+}
+
+export function setActiveStoreId(storeId) {
+  if (storeId) localStorage.setItem(KEYS.ACTIVE_STORE, storeId);
+  else localStorage.removeItem(KEYS.ACTIVE_STORE);
 }
 
 function readJson(key, fallbackFactory) {
@@ -61,7 +73,9 @@ export function getLocalProductsStore() {
 }
 
 export function getLocalCategoriesStore() {
-  return readJson(KEYS.CATEGORIES, () => SEED_CATEGORIES);
+  return readJson(KEYS.CATEGORIES, () =>
+    SEED_CATEGORIES.map((name) => ({ store_id: DEFAULT_LOCAL_STORE_ID, name }))
+  );
 }
 
 export function getLocalOrdersStore() {
@@ -70,6 +84,14 @@ export function getLocalOrdersStore() {
 
 export function getLocalUsersStore() {
   return readJson(KEYS.USERS, () => SEED_USERS);
+}
+
+export function getLocalStoresStore() {
+  return readJson(KEYS.STORES, () => SEED_STORES);
+}
+
+export function getLocalMembersStore() {
+  return readJson(KEYS.MEMBERS, () => SEED_STORE_MEMBERS);
 }
 
 export function getLocalSessionUserId() {
@@ -81,27 +103,38 @@ export function setLocalSessionUserId(userId) {
   else localStorage.removeItem(KEYS.LOCAL_SESSION);
 }
 
-function updateProductsCache(products) {
+function getCacheKey(storeId) {
+  return `${KEYS.PRODUCTS_CACHE}_${storeId || 'default'}`;
+}
+
+function updateProductsCache(storeId, products) {
   try {
-    if (Array.isArray(products)) {
-      localStorage.setItem(KEYS.PRODUCTS_CACHE, JSON.stringify(products));
+    if (storeId && Array.isArray(products)) {
+      localStorage.setItem(getCacheKey(storeId), JSON.stringify(products));
     }
   } catch {
     // Ignore storage quota errors
   }
 }
 
-function getProductsCache() {
+function getProductsCache(storeId) {
   try {
-    const raw = localStorage.getItem(KEYS.PRODUCTS_CACHE);
+    const raw = localStorage.getItem(getCacheKey(storeId));
     return raw ? JSON.parse(raw) : [];
   } catch {
     return [];
   }
 }
 
+function requireStoreId() {
+  const sid = getActiveStoreId();
+  if (!sid) throw new Error('กรุณาเลือกร้านค้าก่อนใช้งาน');
+  return sid;
+}
+
 function normalizeProduct(raw) {
   return {
+    store_id: raw.store_id || getActiveStoreId(),
     barcode: String(raw.barcode || '').trim(),
     name: String(raw.name || '').trim(),
     price: Number(raw.price || 0),
@@ -116,15 +149,208 @@ function normalizeProduct(raw) {
   };
 }
 
+// ─── Multi-Store Management ─────────────────────────────────────────────────
+
+export async function getMyStores(userId) {
+  if (!userId) return [];
+
+  if (isCloudActive()) {
+    const rows = await restGet('store_members', {
+      user_id: `eq.${userId}`,
+      select: 'id,store_id,role,active,stores(id,name,owner_id,created_at)',
+      order: 'created_at.asc',
+    });
+    return (rows || []).map((r) => ({
+      member_id: r.id,
+      id: r.store_id,
+      name: r.stores?.name || 'ร้านค้า',
+      owner_id: r.stores?.owner_id || null,
+      role: r.role,
+      active: r.active !== false,
+      created_at: r.stores?.created_at || r.created_at,
+    }));
+  }
+
+  const stores = getLocalStoresStore();
+  const members = getLocalMembersStore();
+  return members
+    .filter((m) => m.user_id === userId)
+    .map((m) => {
+      const store = stores.find((s) => s.id === m.store_id);
+      if (!store) return null;
+      return {
+        member_id: m.id,
+        id: store.id,
+        name: store.name,
+        owner_id: store.owner_id,
+        role: m.role,
+        active: m.active !== false,
+        created_at: store.created_at,
+      };
+    })
+    .filter(Boolean);
+}
+
+export async function createStore({ name, password, seedDefaultData = true, user }) {
+  const cleanName = String(name || '').trim();
+  const cleanPass = String(password || '');
+  if (!cleanName) throw new Error('กรุณากรอกชื่อร้านค้า');
+  if (!cleanPass) throw new Error('กรุณากำหนดรหัสผ่านร้านค้า');
+
+  if (isCloudActive()) {
+    const res = await restRpc('create_store_with_password', {
+      p_name: cleanName,
+      p_password: cleanPass,
+    });
+    const storeId = res.store_id;
+    setActiveStoreId(storeId);
+    if (seedDefaultData) {
+      await syncLocalDataToCloud(storeId, true);
+    }
+    return {
+      id: storeId,
+      name: res.name,
+      role: res.role || 'owner',
+      active: true,
+    };
+  }
+
+  const stores = getLocalStoresStore();
+  if (stores.some((s) => s.name.trim().toLowerCase() === cleanName.toLowerCase())) {
+    throw new Error(`ชื่อร้านค้า "${cleanName}" ถูกใช้แล้ว`);
+  }
+
+  const newStore = {
+    id: `local-store-${Date.now()}`,
+    name: cleanName,
+    store_password: cleanPass,
+    owner_id: user?.id || 'local-owner-1',
+    created_at: new Date().toISOString(),
+  };
+  stores.push(newStore);
+  writeJson(KEYS.STORES, stores);
+
+  const members = getLocalMembersStore();
+  members.push({
+    id: Date.now(),
+    store_id: newStore.id,
+    user_id: user?.id || 'local-owner-1',
+    role: 'owner',
+    active: true,
+    created_at: new Date().toISOString(),
+  });
+  writeJson(KEYS.MEMBERS, members);
+
+  if (seedDefaultData) {
+    const cats = getLocalCategoriesStore();
+    SEED_CATEGORIES.forEach((catName) => {
+      cats.push({ store_id: newStore.id, name: catName });
+    });
+    writeJson(KEYS.CATEGORIES, cats);
+
+    const prods = getLocalProductsStore();
+    SEED_PRODUCTS.forEach((p) => {
+      prods.push({ ...p, store_id: newStore.id });
+    });
+    writeJson(KEYS.PRODUCTS, prods);
+  }
+
+  setActiveStoreId(newStore.id);
+  return {
+    id: newStore.id,
+    name: newStore.name,
+    role: 'owner',
+    active: true,
+  };
+}
+
+export async function joinStore({ name, password, user }) {
+  const cleanName = String(name || '').trim();
+  const cleanPass = String(password || '');
+  if (!cleanName || !cleanPass) {
+    throw new Error('กรุณากรอกชื่อร้านค้าและรหัสผ่านร้านค้า');
+  }
+
+  if (isCloudActive()) {
+    const res = await restRpc('join_store_with_password', {
+      p_name: cleanName,
+      p_password: cleanPass,
+    });
+    setActiveStoreId(res.store_id);
+    return {
+      id: res.store_id,
+      name: res.name,
+      role: res.role || 'staff',
+      active: res.active !== false,
+    };
+  }
+
+  const stores = getLocalStoresStore();
+  const store = stores.find(
+    (s) => s.name.trim().toLowerCase() === cleanName.toLowerCase()
+  );
+  if (!store || store.store_password !== cleanPass) {
+    throw new Error('ชื่อร้านค้าหรือรหัสผ่านร้านค้าไม่ถูกต้อง');
+  }
+
+  const members = getLocalMembersStore();
+  let membership = members.find(
+    (m) => m.store_id === store.id && m.user_id === user?.id
+  );
+  if (!membership) {
+    membership = {
+      id: Date.now(),
+      store_id: store.id,
+      user_id: user?.id,
+      role: 'staff',
+      active: true,
+      created_at: new Date().toISOString(),
+    };
+    members.push(membership);
+    writeJson(KEYS.MEMBERS, members);
+  }
+
+  setActiveStoreId(store.id);
+  return {
+    id: store.id,
+    name: store.name,
+    role: membership.role,
+    active: membership.active !== false,
+  };
+}
+
+export async function updateStorePassword(storeId, newPassword) {
+  const sid = storeId || requireStoreId();
+  const cleanPass = String(newPassword || '');
+  if (!cleanPass) throw new Error('กรุณากรอกรหัสผ่านใหม่ของร้านค้า');
+
+  if (isCloudActive()) {
+    await restRpc('change_store_password', {
+      p_store_id: sid,
+      p_new_password: cleanPass,
+    });
+    return true;
+  }
+
+  const stores = getLocalStoresStore();
+  const idx = stores.findIndex((s) => s.id === sid);
+  if (idx === -1) throw new Error('ไม่พบร้านค้า');
+  stores[idx] = { ...stores[idx], store_password: cleanPass };
+  writeJson(KEYS.STORES, stores);
+  return true;
+}
+
 // ─── Products ───────────────────────────────────────────────────────────────
 
 export async function lookupBarcode(barcode) {
+  const storeId = requireStoreId();
   const code = String(barcode || '').trim();
   if (!code) return { found: false };
 
   if (isCloudActive()) {
     try {
       const rows = await restGet('products', {
+        store_id: `eq.${storeId}`,
         barcode: `eq.${code}`,
         select: '*',
       });
@@ -133,36 +359,47 @@ export async function lookupBarcode(barcode) {
       }
       return { found: false };
     } catch (err) {
-      const cached = getProductsCache().find((p) => p.barcode === code);
-      if (cached) return { found: true, product: normalizeProduct(cached), offlineCache: true };
+      const cached = getProductsCache(storeId).find((p) => p.barcode === code);
+      if (cached) {
+        return { found: true, product: normalizeProduct(cached), offlineCache: true };
+      }
       throw err;
     }
   }
 
   const products = getLocalProductsStore();
-  const hit = products.find((p) => p.barcode === code);
+  const hit = products.find((p) => p.store_id === storeId && p.barcode === code);
   if (!hit) return { found: false };
   return { found: true, product: normalizeProduct(hit) };
 }
 
 export async function getAllProducts() {
+  const storeId = requireStoreId();
+
   if (isCloudActive()) {
-    const rows = await restGet('products', { select: '*', order: 'name.asc' });
+    const rows = await restGet('products', {
+      store_id: `eq.${storeId}`,
+      select: '*',
+      order: 'name.asc',
+    });
     const normalized = (rows || []).map(normalizeProduct);
-    updateProductsCache(normalized);
+    updateProductsCache(storeId, normalized);
     return normalized;
   }
 
   const products = getLocalProductsStore()
+    .filter((p) => p.store_id === storeId)
     .map(normalizeProduct)
     .sort((a, b) => a.name.localeCompare(b.name, 'th'));
-  updateProductsCache(products);
+  updateProductsCache(storeId, products);
   return products;
 }
 
 export async function saveProduct(productData) {
+  const storeId = requireStoreId();
   const now = new Date().toISOString();
   const payload = {
+    store_id: storeId,
     barcode: String(productData.barcode || '').trim(),
     name: String(productData.name || '').trim(),
     price: Number(productData.price || 0),
@@ -185,19 +422,22 @@ export async function saveProduct(productData) {
     const rows = await restPost(
       'products',
       payload,
-      { Prefer: 'resolution=merge-duplicates,return=representation' }
+      { Prefer: 'resolution=merge-duplicates,return=representation' },
+      { on_conflict: 'store_id,barcode' }
     );
     const saved = normalizeProduct(rows?.[0] || payload);
-    const cache = getProductsCache();
+    const cache = getProductsCache(storeId);
     const idx = cache.findIndex((p) => p.barcode === saved.barcode);
     if (idx !== -1) cache[idx] = saved;
     else cache.push(saved);
-    updateProductsCache(cache);
+    updateProductsCache(storeId, cache);
     return saved;
   }
 
   const products = getLocalProductsStore();
-  const idx = products.findIndex((p) => p.barcode === payload.barcode);
+  const idx = products.findIndex(
+    (p) => p.store_id === storeId && p.barcode === payload.barcode
+  );
   let saved;
   if (idx !== -1) {
     saved = normalizeProduct({ ...products[idx], ...payload });
@@ -207,11 +447,15 @@ export async function saveProduct(productData) {
     products.push(saved);
   }
   writeJson(KEYS.PRODUCTS, products);
-  updateProductsCache(products);
+  updateProductsCache(
+    storeId,
+    products.filter((p) => p.store_id === storeId)
+  );
   return saved;
 }
 
 export async function updateProduct(barcode, productData) {
+  const storeId = requireStoreId();
   const code = String(barcode || '').trim();
   const now = new Date().toISOString();
   const patch = {
@@ -229,27 +473,42 @@ export async function updateProduct(barcode, productData) {
   };
 
   if (isCloudActive()) {
-    const rows = await restPatch('products', { barcode: `eq.${code}` }, patch);
+    const rows = await restPatch(
+      'products',
+      { store_id: `eq.${storeId}`, barcode: `eq.${code}` },
+      patch
+    );
     if (!rows?.length) throw new Error('ไม่พบสินค้าในระบบ');
     const saved = normalizeProduct(rows[0]);
-    const cache = getProductsCache();
+    const cache = getProductsCache(storeId);
     const idx = cache.findIndex((p) => p.barcode === code);
     if (idx !== -1) cache[idx] = saved;
-    updateProductsCache(cache);
+    updateProductsCache(storeId, cache);
     return saved;
   }
 
   const products = getLocalProductsStore();
-  const idx = products.findIndex((p) => p.barcode === code);
+  const idx = products.findIndex(
+    (p) => p.store_id === storeId && p.barcode === code
+  );
   if (idx === -1) throw new Error('ไม่พบสินค้าในระบบ');
-  const saved = normalizeProduct({ ...products[idx], ...patch, barcode: code });
+  const saved = normalizeProduct({
+    ...products[idx],
+    ...patch,
+    store_id: storeId,
+    barcode: code,
+  });
   products[idx] = saved;
   writeJson(KEYS.PRODUCTS, products);
-  updateProductsCache(products);
+  updateProductsCache(
+    storeId,
+    products.filter((p) => p.store_id === storeId)
+  );
   return saved;
 }
 
 export async function adjustStock(barcode, delta) {
+  const storeId = requireStoreId();
   const code = String(barcode || '').trim();
   const change = parseInt(delta, 10) || 0;
 
@@ -259,19 +518,21 @@ export async function adjustStock(barcode, delta) {
     const nextQty = Math.max(0, Number(found.product.stock_qty || 0) + change);
     const rows = await restPatch(
       'products',
-      { barcode: `eq.${code}` },
+      { store_id: `eq.${storeId}`, barcode: `eq.${code}` },
       { stock_qty: nextQty, updated_at: new Date().toISOString() }
     );
     const saved = normalizeProduct(rows?.[0] || { ...found.product, stock_qty: nextQty });
-    const cache = getProductsCache();
+    const cache = getProductsCache(storeId);
     const idx = cache.findIndex((p) => p.barcode === code);
     if (idx !== -1) cache[idx] = saved;
-    updateProductsCache(cache);
+    updateProductsCache(storeId, cache);
     return saved;
   }
 
   const products = getLocalProductsStore();
-  const idx = products.findIndex((p) => p.barcode === code);
+  const idx = products.findIndex(
+    (p) => p.store_id === storeId && p.barcode === code
+  );
   if (idx === -1) throw new Error('ไม่พบสินค้า');
   const nextQty = Math.max(0, Number(products[idx].stock_qty || 0) + change);
   products[idx] = normalizeProduct({
@@ -280,66 +541,96 @@ export async function adjustStock(barcode, delta) {
     updated_at: new Date().toISOString(),
   });
   writeJson(KEYS.PRODUCTS, products);
-  updateProductsCache(products);
+  updateProductsCache(
+    storeId,
+    products.filter((p) => p.store_id === storeId)
+  );
   return products[idx];
 }
 
 export async function deleteProduct(barcode) {
+  const storeId = requireStoreId();
   const code = String(barcode || '').trim();
   if (isCloudActive()) {
-    await restDelete('products', { barcode: `eq.${code}` });
-    const cache = getProductsCache().filter((p) => p.barcode !== code);
-    updateProductsCache(cache);
+    await restDelete('products', {
+      store_id: `eq.${storeId}`,
+      barcode: `eq.${code}`,
+    });
+    const cache = getProductsCache(storeId).filter((p) => p.barcode !== code);
+    updateProductsCache(storeId, cache);
     return { ok: true };
   }
 
-  const products = getLocalProductsStore().filter((p) => p.barcode !== code);
+  const products = getLocalProductsStore().filter(
+    (p) => !(p.store_id === storeId && p.barcode === code)
+  );
   writeJson(KEYS.PRODUCTS, products);
-  updateProductsCache(products);
+  updateProductsCache(
+    storeId,
+    products.filter((p) => p.store_id === storeId)
+  );
   return { ok: true };
 }
 
 // ─── Categories ─────────────────────────────────────────────────────────────
 
 export async function getCategories() {
+  const storeId = requireStoreId();
+
   if (isCloudActive()) {
-    const rows = await restGet('categories', { select: 'name', order: 'name.asc' });
+    const rows = await restGet('categories', {
+      store_id: `eq.${storeId}`,
+      select: 'name',
+      order: 'name.asc',
+    });
     return (rows || []).map((r) => r.name);
   }
-  return [...getLocalCategoriesStore()].sort((a, b) => a.localeCompare(b, 'th'));
+
+  return getLocalCategoriesStore()
+    .filter((c) => c.store_id === storeId)
+    .map((c) => c.name)
+    .sort((a, b) => a.localeCompare(b, 'th'));
 }
 
 export async function addCategory(name) {
+  const storeId = requireStoreId();
   const trimmed = String(name || '').trim();
   if (!trimmed) throw new Error('กรุณากรอกชื่อหมวดหมู่');
 
   if (isCloudActive()) {
     await restPost(
       'categories',
-      { name: trimmed },
-      { Prefer: 'resolution=ignore-duplicates,return=representation' }
+      { store_id: storeId, name: trimmed },
+      { Prefer: 'resolution=ignore-duplicates,return=representation' },
+      { on_conflict: 'store_id,name' }
     );
     return { ok: true, name: trimmed };
   }
 
   const cats = getLocalCategoriesStore();
-  if (!cats.includes(trimmed)) {
-    cats.push(trimmed);
+  if (!cats.some((c) => c.store_id === storeId && c.name === trimmed)) {
+    cats.push({ store_id: storeId, name: trimmed });
     writeJson(KEYS.CATEGORIES, cats);
   }
   return { ok: true, name: trimmed };
 }
 
 export async function deleteCategory(name) {
+  const storeId = requireStoreId();
   const trimmed = String(name || '').trim();
   if (!trimmed) return { ok: true };
 
   if (isCloudActive()) {
-    await restDelete('categories', { name: `eq.${trimmed}` });
+    await restDelete('categories', {
+      store_id: `eq.${storeId}`,
+      name: `eq.${trimmed}`,
+    });
     return { ok: true };
   }
 
-  const cats = getLocalCategoriesStore().filter((c) => c !== trimmed);
+  const cats = getLocalCategoriesStore().filter(
+    (c) => !(c.store_id === storeId && c.name === trimmed)
+  );
   writeJson(KEYS.CATEGORIES, cats);
   return { ok: true };
 }
@@ -352,6 +643,7 @@ export async function createOrder({
   cashReceived = 0,
   cashier = null,
 }) {
+  const storeId = requireStoreId();
   if (!items || items.length === 0) {
     throw new Error('ไม่มีสินค้าในตะกร้า');
   }
@@ -368,11 +660,14 @@ export async function createOrder({
   const totalAmount = normalizedItems.reduce((s, i) => s + i.price * i.qty, 0);
   const totalCost = normalizedItems.reduce((s, i) => s + i.cost_price * i.qty, 0);
   const totalItems = normalizedItems.reduce((s, i) => s + i.qty, 0);
-  const received = paymentMethod === 'cash' ? Number(cashReceived || totalAmount) : totalAmount;
-  const changeGiven = paymentMethod === 'cash' ? Math.max(0, received - totalAmount) : 0;
+  const received =
+    paymentMethod === 'cash' ? Number(cashReceived || totalAmount) : totalAmount;
+  const changeGiven =
+    paymentMethod === 'cash' ? Math.max(0, received - totalAmount) : 0;
 
   if (isCloudActive()) {
     const orderRows = await restPost('orders', {
+      store_id: storeId,
       cashier_id: cashier?.id || null,
       cashier_name: cashier?.display_name || cashier?.email || 'พนักงาน',
       total_amount: totalAmount,
@@ -388,6 +683,7 @@ export async function createOrder({
     if (!order?.id) throw new Error('ไม่สามารถสร้างบิลขายได้');
 
     const itemPayloads = normalizedItems.map((item) => ({
+      store_id: storeId,
       order_id: order.id,
       barcode: item.barcode,
       name: item.name,
@@ -398,7 +694,6 @@ export async function createOrder({
     }));
     const createdItems = await restPost('order_items', itemPayloads);
 
-    // Deduct stock for each sold item
     await Promise.all(
       normalizedItems.map(async (item) => {
         try {
@@ -419,13 +714,14 @@ export async function createOrder({
     };
   }
 
-  // Local storage engine
   const orders = getLocalOrdersStore();
+  const storeOrders = orders.filter((o) => o.store_id === storeId);
   const nextOrderNo =
-    orders.reduce((max, o) => Math.max(max, Number(o.order_no || 0)), 0) + 1;
+    storeOrders.reduce((max, o) => Math.max(max, Number(o.order_no || 0)), 0) + 1;
 
   const newOrder = {
     id: `local-order-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    store_id: storeId,
     order_no: nextOrderNo,
     cashier_id: cashier?.id || null,
     cashier_name: cashier?.display_name || 'พนักงาน',
@@ -447,11 +743,12 @@ export async function createOrder({
   orders.unshift(newOrder);
   writeJson(KEYS.ORDERS, orders);
 
-  // Deduct stock locally
   const products = getLocalProductsStore();
   let changed = false;
   for (const sold of normalizedItems) {
-    const idx = products.findIndex((p) => p.barcode === sold.barcode);
+    const idx = products.findIndex(
+      (p) => p.store_id === storeId && p.barcode === sold.barcode
+    );
     if (idx !== -1) {
       products[idx] = normalizeProduct({
         ...products[idx],
@@ -463,17 +760,22 @@ export async function createOrder({
   }
   if (changed) {
     writeJson(KEYS.PRODUCTS, products);
-    updateProductsCache(products);
+    updateProductsCache(
+      storeId,
+      products.filter((p) => p.store_id === storeId)
+    );
   }
 
   return newOrder;
 }
 
 export async function voidOrder(orderId) {
+  const storeId = requireStoreId();
   if (!orderId) throw new Error('ไม่พบรหัสบิล');
 
   if (isCloudActive()) {
     const rows = await restGet('orders', {
+      store_id: `eq.${storeId}`,
       id: `eq.${orderId}`,
       select: '*,order_items(*)',
     });
@@ -483,7 +785,7 @@ export async function voidOrder(orderId) {
 
     const updatedRows = await restPatch(
       'orders',
-      { id: `eq.${orderId}` },
+      { store_id: `eq.${storeId}`, id: `eq.${orderId}` },
       { status: 'voided' }
     );
     const items = order.order_items || [];
@@ -500,18 +802,21 @@ export async function voidOrder(orderId) {
   }
 
   const orders = getLocalOrdersStore();
-  const idx = orders.findIndex((o) => o.id === orderId);
+  const idx = orders.findIndex(
+    (o) => o.store_id === storeId && o.id === orderId
+  );
   if (idx === -1) throw new Error('ไม่พบบิลขายนี้');
   if (orders[idx].status === 'voided') return orders[idx];
 
   orders[idx] = { ...orders[idx], status: 'voided' };
   writeJson(KEYS.ORDERS, orders);
 
-  // Restore stock
   const products = getLocalProductsStore();
   const now = new Date().toISOString();
   for (const item of orders[idx].items || []) {
-    const pIdx = products.findIndex((p) => p.barcode === item.barcode);
+    const pIdx = products.findIndex(
+      (p) => p.store_id === storeId && p.barcode === item.barcode
+    );
     if (pIdx !== -1) {
       products[pIdx] = normalizeProduct({
         ...products[pIdx],
@@ -521,7 +826,10 @@ export async function voidOrder(orderId) {
     }
   }
   writeJson(KEYS.PRODUCTS, products);
-  updateProductsCache(products);
+  updateProductsCache(
+    storeId,
+    products.filter((p) => p.store_id === storeId)
+  );
   return orders[idx];
 }
 
@@ -541,6 +849,7 @@ function getBangkokHour(isoString) {
 }
 
 export async function getDashboardData({ dateFrom, dateTo } = {}) {
+  const storeId = requireStoreId();
   const fromDate = dateFrom || getBangkokDateString();
   const toDate = dateTo || fromDate;
 
@@ -553,6 +862,7 @@ export async function getDashboardData({ dateFrom, dateTo } = {}) {
   if (isCloudActive()) {
     const [ordersRes, productsRes] = await Promise.all([
       restGet('orders', {
+        store_id: `eq.${storeId}`,
         select: '*,order_items(*)',
         and: `(sold_at.gte.${fromDate}T00:00:00+07:00,sold_at.lte.${toDate}T23:59:59.999+07:00)`,
         order: 'sold_at.desc',
@@ -578,6 +888,7 @@ export async function getDashboardData({ dateFrom, dateTo } = {}) {
     products = await getAllProducts();
     rawOrders = getLocalOrdersStore()
       .filter((o) => {
+        if (o.store_id !== storeId) return false;
         const ts = new Date(o.sold_at).getTime();
         return ts >= startTs && ts <= endTs;
       })
@@ -649,115 +960,154 @@ export async function getDashboardData({ dateFrom, dateTo } = {}) {
   };
 }
 
-// ─── Team & Role Management ─────────────────────────────────────────────────
+// ─── Store Team & Role Management ───────────────────────────────────────────
 
 export async function getTeamMembers() {
+  const storeId = requireStoreId();
+
   if (isCloudActive()) {
-    const rows = await restGet('profiles', {
-      select: '*',
+    const rows = await restGet('store_members', {
+      store_id: `eq.${storeId}`,
+      select: 'id,store_id,user_id,role,active,created_at,profiles(id,email,display_name)',
       order: 'created_at.asc',
     });
-    return rows || [];
+    return (rows || []).map((r) => ({
+      id: r.id,
+      store_id: r.store_id,
+      user_id: r.user_id,
+      email: r.profiles?.email || '',
+      display_name: r.profiles?.display_name || 'ผู้ใช้',
+      role: r.role,
+      active: r.active !== false,
+      created_at: r.created_at,
+    }));
   }
 
-  return getLocalUsersStore().map(({ password, ...safe }) => safe);
+  const users = getLocalUsersStore();
+  return getLocalMembersStore()
+    .filter((m) => m.store_id === storeId)
+    .map((m) => {
+      const u = users.find((usr) => usr.id === m.user_id);
+      return {
+        id: m.id,
+        store_id: m.store_id,
+        user_id: m.user_id,
+        email: u?.email || '',
+        display_name: u?.display_name || 'ผู้ใช้',
+        role: m.role,
+        active: m.active !== false,
+        created_at: m.created_at,
+      };
+    });
 }
 
-export async function updateTeamMember(id, updates) {
+export async function updateTeamMember(memberId, updates) {
+  const storeId = requireStoreId();
   const allowed = {};
   if (updates.role !== undefined) allowed.role = updates.role;
   if (updates.active !== undefined) allowed.active = Boolean(updates.active);
-  if (updates.display_name !== undefined) allowed.display_name = String(updates.display_name).trim();
 
   if (isCloudActive()) {
-    const rows = await restPatch('profiles', { id: `eq.${id}` }, allowed);
+    const rows = await restPatch(
+      'store_members',
+      { id: `eq.${memberId}`, store_id: `eq.${storeId}` },
+      allowed
+    );
     return rows?.[0] || null;
   }
 
-  const users = getLocalUsersStore();
-  const idx = users.findIndex((u) => u.id === id);
-  if (idx === -1) throw new Error('ไม่พบบัญชีผู้ใช้');
-  users[idx] = { ...users[idx], ...allowed };
-  writeJson(KEYS.USERS, users);
-  const { password, ...safe } = users[idx];
-  return safe;
+  const members = getLocalMembersStore();
+  const idx = members.findIndex(
+    (m) => m.id === memberId && m.store_id === storeId
+  );
+  if (idx === -1) throw new Error('ไม่พบสมาชิกในร้านนี้');
+  members[idx] = { ...members[idx], ...allowed };
+  writeJson(KEYS.MEMBERS, members);
+  return members[idx];
 }
 
-export async function createTeamMember({ email, password, display_name, role = 'staff' }) {
-  const cleanEmail = String(email || '').trim().toLowerCase();
-  const cleanName = String(display_name || '').trim() || cleanEmail.split('@')[0];
-  if (!cleanEmail || !password || password.length < 6) {
-    throw new Error('กรุณากรอกอีเมลและรหัสผ่านอย่างน้อย 6 ตัวอักษร');
-  }
+export async function removeTeamMember(memberId) {
+  const storeId = requireStoreId();
 
   if (isCloudActive()) {
-    const res = await cloudAdminInviteSignUp(cleanEmail, password, cleanName, role);
-    return {
-      id: res?.user?.id || null,
-      email: cleanEmail,
-      display_name: cleanName,
-      role,
-      active: true,
-      needsEmailConfirm: Boolean(res?.user && !res?.access_token),
-    };
+    await restDelete('store_members', {
+      id: `eq.${memberId}`,
+      store_id: `eq.${storeId}`,
+    });
+    return { ok: true };
   }
 
-  const users = getLocalUsersStore();
-  if (users.some((u) => u.email.toLowerCase() === cleanEmail)) {
-    throw new Error('อีเมลนี้ถูกใช้งานแล้ว');
-  }
-  const newUser = {
-    id: `local-user-${Date.now()}`,
-    email: cleanEmail,
-    password,
-    display_name: cleanName,
-    role: role === 'owner' ? 'owner' : 'staff',
-    active: true,
-    created_at: new Date().toISOString(),
-  };
-  users.push(newUser);
-  writeJson(KEYS.USERS, users);
-  const { password: _pw, ...safe } = newUser;
-  return safe;
+  const members = getLocalMembersStore().filter(
+    (m) => !(m.id === memberId && m.store_id === storeId)
+  );
+  writeJson(KEYS.MEMBERS, members);
+  return { ok: true };
 }
 
 // ─── Cloud Migration Helper ─────────────────────────────────────────────────
 
-export async function syncLocalDataToCloud() {
+export async function syncLocalDataToCloud(targetStoreId = null, useSeedDefaults = false) {
   if (!isCloudConfigured()) {
     throw new Error('กรุณาเชื่อมต่อ Supabase URL และ Anon Key ก่อนอัปโหลดข้อมูล');
   }
+  const storeId = targetStoreId || requireStoreId();
 
-  const categories = getLocalCategoriesStore();
-  const products = getLocalProductsStore().map(normalizeProduct);
+  const categoryNames = useSeedDefaults
+    ? SEED_CATEGORIES
+    : Array.from(
+        new Set(
+          getLocalCategoriesStore()
+            .filter((c) => c.store_id === storeId || c.store_id === DEFAULT_LOCAL_STORE_ID)
+            .map((c) => c.name)
+        )
+      );
 
-  const catPayload = categories.map((name) => ({ name }));
+  const localStoreProducts = getLocalProductsStore().filter(
+    (p) => p.store_id === storeId
+  );
+  const sourceProducts =
+    !useSeedDefaults && localStoreProducts.length > 0
+      ? localStoreProducts
+      : SEED_PRODUCTS;
+
+  const catPayload = (categoryNames.length ? categoryNames : SEED_CATEGORIES).map(
+    (name) => ({ store_id: storeId, name })
+  );
   if (catPayload.length > 0) {
-    await restPost('categories', catPayload, {
-      Prefer: 'resolution=ignore-duplicates,return=representation',
-    });
+    await restPost(
+      'categories',
+      catPayload,
+      { Prefer: 'resolution=ignore-duplicates,return=representation' },
+      { on_conflict: 'store_id,name' }
+    );
   }
 
   const chunkSize = 50;
-  for (let i = 0; i < products.length; i += chunkSize) {
-    const chunk = products.slice(i, i + chunkSize).map((p) => ({
+  for (let i = 0; i < sourceProducts.length; i += chunkSize) {
+    const chunk = sourceProducts.slice(i, i + chunkSize).map((p) => ({
+      store_id: storeId,
       barcode: p.barcode,
       name: p.name,
-      price: p.price,
-      cost_price: p.cost_price,
-      stock_qty: p.stock_qty,
-      low_stock_threshold: p.low_stock_threshold,
-      category: p.category,
+      price: Number(p.price),
+      cost_price: Number(p.cost_price ?? 0),
+      stock_qty: Number.isFinite(Number(p.stock_qty)) ? parseInt(p.stock_qty, 10) : 24,
+      low_stock_threshold: Number.isFinite(Number(p.low_stock_threshold))
+        ? parseInt(p.low_stock_threshold, 10)
+        : 5,
+      category: p.category || '',
       updated_at: new Date().toISOString(),
     }));
-    await restPost('products', chunk, {
-      Prefer: 'resolution=merge-duplicates,return=representation',
-    });
+    await restPost(
+      'products',
+      chunk,
+      { Prefer: 'resolution=merge-duplicates,return=representation' },
+      { on_conflict: 'store_id,barcode' }
+    );
   }
 
   return {
-    categoriesCount: categories.length,
-    productsCount: products.length,
+    categoriesCount: catPayload.length,
+    productsCount: sourceProducts.length,
   };
 }
 

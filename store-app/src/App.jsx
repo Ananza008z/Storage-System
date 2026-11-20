@@ -1,6 +1,7 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext.jsx';
 import Login from './components/Login.jsx';
+import StoreSelect from './components/StoreSelect.jsx';
 import Scanner from './components/Scanner.jsx';
 import Inventory from './components/Inventory.jsx';
 import Dashboard from './components/Dashboard.jsx';
@@ -58,10 +59,27 @@ const BASE_TABS = [
 ];
 
 function StoreShell() {
-  const { user, profile, isOwner, isActive, mode, loading, logout } = useAuth();
+  const {
+    user,
+    profile,
+    currentStore,
+    choosingStore,
+    setChoosingStore,
+    isOwner,
+    isActive,
+    mode,
+    loading,
+    logout,
+  } = useAuth();
+
   const [tab, setTab] = useState('scanner');
   const [cart, setCart] = useState([]);
   const [refreshSignal, setRefreshSignal] = useState(0);
+
+  // Clear cart whenever switching active store
+  useEffect(() => {
+    setCart([]);
+  }, [currentStore?.id]);
 
   const visibleTabs = useMemo(
     () => BASE_TABS.filter((t) => !t.ownerOnly || isOwner),
@@ -80,21 +98,34 @@ function StoreShell() {
     return <Login />;
   }
 
+  if (!currentStore || choosingStore) {
+    return <StoreSelect />;
+  }
+
   if (!isActive) {
     return (
       <div className="min-h-screen flex items-center justify-center p-4">
         <div className="max-w-sm w-full bg-white rounded-2xl border border-red-100 shadow-sm p-6 text-center space-y-3">
-          <p className="text-lg font-bold text-red-600">บัญชีนี้ถูกระงับการใช้งาน</p>
+          <p className="text-lg font-bold text-red-600">บัญชีถูกระงับสิทธิ์ในร้านนี้</p>
           <p className="text-sm text-gray-500">
-            กรุณาติดต่อเจ้าของร้าน ({profile.email}) เพื่อเปิดสิทธิ์การใช้งานอีกครั้ง
+            สิทธิ์ของคุณในร้าน "{currentStore.name}" ถูกระงับชั่วคราว กรุณาติดต่อเจ้าของร้านหรือสลับไปร้านอื่น
           </p>
-          <button
-            type="button"
-            onClick={logout}
-            className="w-full py-2.5 rounded-xl bg-gray-100 hover:bg-gray-200 text-sm font-medium text-gray-700"
-          >
-            ออกจากระบบ
-          </button>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setChoosingStore(true)}
+              className="flex-1 py-2.5 rounded-xl bg-green-700 text-white text-sm font-medium"
+            >
+              สลับร้านค้า
+            </button>
+            <button
+              type="button"
+              onClick={logout}
+              className="flex-1 py-2.5 rounded-xl bg-gray-100 hover:bg-gray-200 text-sm font-medium text-gray-700"
+            >
+              ออกจากระบบ
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -112,7 +143,7 @@ function StoreShell() {
   return (
     <div className="min-h-screen flex flex-col">
       <nav className="bg-white border-b border-gray-100 shadow-sm sticky top-0 z-40">
-        <div className="max-w-3xl mx-auto px-3 sm:px-4 h-14 flex items-center justify-between gap-2">
+        <div className="max-w-6xl mx-auto px-3 sm:px-4 h-14 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
             <div className="w-7 h-7 bg-green-700 rounded-lg flex items-center justify-center shrink-0">
               <svg
@@ -131,9 +162,19 @@ function StoreShell() {
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-1.5">
-                <span className="font-bold text-gray-800 text-sm truncate">ระบบร้านค้า</span>
+                <button
+                  type="button"
+                  onClick={() => setChoosingStore(true)}
+                  className="flex items-center gap-1 font-bold text-gray-800 text-sm hover:text-green-700 truncate max-w-[140px] sm:max-w-[200px]"
+                  title="คลิกเพื่อสลับร้านค้า"
+                >
+                  <span className="truncate">{currentStore.name}</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium shrink-0">
+                    สลับร้าน
+                  </span>
+                </button>
                 <span
-                  className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium shrink-0 ${
+                  className={`hidden sm:inline-block text-[10px] px-1.5 py-0.5 rounded-full font-medium shrink-0 ${
                     mode === 'cloud'
                       ? 'bg-emerald-50 text-emerald-700'
                       : 'bg-amber-50 text-amber-700'
@@ -164,12 +205,12 @@ function StoreShell() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            <div className="text-right hidden xs:block sm:block">
-              <p className="text-xs font-semibold text-gray-700 leading-tight max-w-[100px] truncate">
+            <div className="text-right">
+              <p className="text-xs font-semibold text-gray-700 leading-tight max-w-[90px] truncate">
                 {profile.display_name}
               </p>
               <p className="text-[10px] text-green-700 font-medium leading-tight">
-                {isOwner ? 'เจ้าของร้าน' : 'พนักงานขาย'}
+                {isOwner ? 'เจ้าของร้าน' : 'พนักงาน'}
               </p>
             </div>
             <button
@@ -183,11 +224,12 @@ function StoreShell() {
         </div>
       </nav>
 
-      <main className="flex-1 pb-20 sm:pb-6">
+      <main className="flex-1 pb-20 sm:pb-6" key={currentStore.id}>
         <div style={{ display: activeTab === 'scanner' ? 'block' : 'none' }}>
           <Scanner
             cart={cart}
             setCart={setCart}
+            isActiveTab={activeTab === 'scanner'}
             onOrderCompleted={() => setRefreshSignal((s) => s + 1)}
           />
         </div>
