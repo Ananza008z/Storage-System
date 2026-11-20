@@ -3,7 +3,11 @@ const SESSION_KEY = 'store_supabase_session';
 
 export function getCloudConfig() {
   const envUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim().replace(/\/+$/, '');
-  const envKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
+  const envKey = (
+    import.meta.env.VITE_SUPABASE_ANON_KEY ||
+    import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+    ''
+  ).trim();
   if (envUrl && envKey) {
     return { url: envUrl, anonKey: envKey, source: 'env' };
   }
@@ -85,9 +89,10 @@ async function parseResponse(res) {
 
 function buildHeaders(extra = {}, accessToken = null) {
   const { anonKey } = getCloudConfig();
+  const bearer = accessToken || (anonKey.startsWith('eyJ') ? anonKey : '');
   return {
     apikey: anonKey,
-    Authorization: `Bearer ${accessToken || anonKey}`,
+    ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
     'Content-Type': 'application/json',
     ...extra,
   };
@@ -275,12 +280,14 @@ export async function testCloudConnection(testUrl, testAnonKey) {
   const cleanKey = (testAnonKey || '').trim();
   if (!cleanUrl || !cleanKey) throw new Error('กรุณากรอก URL และ Anon Key ให้ครบ');
 
+  const headers = {
+    apikey: cleanKey,
+    ...(cleanKey.startsWith('eyJ') ? { Authorization: `Bearer ${cleanKey}` } : {}),
+  };
+
   const res = await fetch(`${cleanUrl}/auth/v1/settings`, {
     method: 'GET',
-    headers: {
-      apikey: cleanKey,
-      Authorization: `Bearer ${cleanKey}`,
-    },
+    headers,
   });
   return parseResponse(res);
 }
