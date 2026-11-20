@@ -1,0 +1,17 @@
+{
+  "name": "ระบบร้านค้า POS",
+  "short_name": "ร้านค้า POS",
+  "description": "ระบบสแกนบาร์โค้ด ขายหน้าร้าน และจัดการสต็อกสินค้าออนไลน์",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f0f4f0",
+  "theme_color": "#15803d",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
